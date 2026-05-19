@@ -105,6 +105,64 @@ def filter_deskew(img):
     return cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
 
 
+# ── Segmentation functions ────────────────────────────────────────────────
+
+def _to_binary(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return binary
+
+
+def detect_lines(img):
+    binary = _to_binary(img)
+    # Dilate horizontally to merge nearby ink into solid line bands
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    dilated = cv2.dilate(binary, kernel)
+
+    # Horizontal projection profile
+    h_proj = np.sum(dilated, axis=1)
+    threshold = np.max(h_proj) * 0.05
+
+    rects, start = [], None
+    for i, val in enumerate(h_proj):
+        if val > threshold and start is None:
+            start = i
+        elif val <= threshold and start is not None:
+            if i - start > 5:
+                rects.append((0, start, img.shape[1], i - start))
+            start = None
+    if start is not None:
+        rects.append((0, start, img.shape[1], img.shape[0] - start))
+    return rects
+
+
+def detect_characters(img, line_rects):
+    binary = _to_binary(img)
+    min_area = max(20, int(img.shape[0] * img.shape[1] * 0.00005))
+    rects = []
+    for (lx, ly, lw, lh) in line_rects:
+        region = binary[ly:ly + lh, lx:lx + lw]
+        n, _, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
+        for i in range(1, n):
+            x, y, w, h, area = stats[i]
+            if area >= min_area and w > 2 and h > 2:
+                rects.append((lx + x, ly + y, w, h))
+    return rects
+
+
+def draw_overlays(img, line_rects, char_rects, show_lines, show_chars):
+    out = img.copy()
+    if len(out.shape) == 2:
+        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+    if show_lines:
+        for (x, y, w, h) in line_rects:
+            cv2.rectangle(out, (x, y), (x + w, y + h), (34, 160, 34), 2)
+    if show_chars:
+        for (x, y, w, h) in char_rects:
+            cv2.rectangle(out, (x, y), (x + w, y + h), (30, 100, 220), 1)
+    return out
+
+
 # ── Icon drawing ───────────────────────────────────────────────────────────
 
 def _make_icon(draw_fn):
@@ -168,13 +226,29 @@ def icon_denoise(p, s):
 
 
 def icon_deskew(p, s):
-    # Tilted line + straight corrected line
     pen = QPen(QColor("#c44"), 2)
     pen.setStyle(Qt.PenStyle.DashLine)
     p.setPen(pen)
     p.drawLine(3, s - 6, s - 3, 5)
     p.setPen(QPen(QColor("#333"), 2))
     p.drawLine(3, s // 2, s - 3, s // 2)
+
+
+def icon_lines(p, s):
+    # Three horizontal rectangles representing text lines
+    p.setPen(Qt.PenStyle.NoPen)
+    for i, y in enumerate([4, 11, 18]):
+        color = QColor("#22a022") if i == 1 else QColor("#aaddaa")
+        p.setBrush(QBrush(color))
+        p.drawRect(QRect(2, y, s - 4, 5))
+
+
+def icon_characters(p, s):
+    # Small rectangles representing individual characters
+    p.setPen(QPen(QColor("#2264e0"), 1))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    for x, y, w, h in [(2, 4, 7, 18), (11, 4, 5, 18), (18, 4, 6, 18)]:
+        p.drawRect(QRect(x, y, w, h))
 
 
 # ── Filter bar ─────────────────────────────────────────────────────────────
@@ -191,7 +265,7 @@ FILTERS = [
 
 
 class FilterBar(QWidget):
-    def __init__(self, on_filter_changed, parent=None):
+    def __init__(self, on_filter_changed, on_lines_toggled, on_chars_toggled, parent=None):
         super().__init__(parent)
         self.on_filter_changed = on_filter_changed
         self.setFixedHeight(52)
@@ -201,6 +275,7 @@ class FilterBar(QWidget):
         layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(6)
 
+        # ── Filter buttons (exclusive) ──
         label = QLabel("Filters:")
         label.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: bold;")
         layout.addWidget(label)
@@ -216,13 +291,45 @@ class FilterBar(QWidget):
             btn.setIcon(QIcon(_make_icon(icon_fn)))
             btn.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
             btn.setToolTip(f"<b>{name}</b><br>{tip}")
-            btn.setProperty("filter_fn", fn)
             btn.setStyleSheet(self._btn_style())
             self._group.addButton(btn, i)
             layout.addWidget(btn)
 
         self._group.idToggled.connect(self._on_toggled)
+
+        # ── Separator ──
+        sep = QWidget()
+        sep.setFixedSize(1, 34)
+        sep.setStyleSheet(f"background: {C_BORDER};")
+        layout.addSpacing(6)
+        layout.addWidget(sep)
+        layout.addSpacing(6)
+
+        # ── Segmentation buttons (independent toggles) ──
+        seg_label = QLabel("Detect:")
+        seg_label.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: bold;")
+        layout.addWidget(seg_label)
+
+        self._btn_lines = self._make_seg_btn(
+            icon_lines, "<b>Find Lines</b><br>Detect text line boundaries", on_lines_toggled
+        )
+        self._btn_chars = self._make_seg_btn(
+            icon_characters, "<b>Find Characters</b><br>Detect individual character boundaries", on_chars_toggled
+        )
+        layout.addWidget(self._btn_lines)
+        layout.addWidget(self._btn_chars)
         layout.addStretch()
+
+    def _make_seg_btn(self, icon_fn, tip, callback):
+        btn = QPushButton()
+        btn.setCheckable(True)
+        btn.setFixedSize(38, 38)
+        btn.setIcon(QIcon(_make_icon(icon_fn)))
+        btn.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
+        btn.setToolTip(tip)
+        btn.setStyleSheet(self._btn_style())
+        btn.toggled.connect(callback)
+        return btn
 
     def _btn_style(self):
         return f"""
@@ -243,8 +350,7 @@ class FilterBar(QWidget):
 
     def _on_toggled(self, btn_id, checked):
         if checked:
-            fn = FILTERS[btn_id][2]
-            self.on_filter_changed(fn)
+            self.on_filter_changed(FILTERS[btn_id][2])
 
     def current_filter(self):
         idx = self._group.checkedId()
@@ -424,6 +530,10 @@ class MainWindow(QMainWindow):
         self._current_path = None
         self._cv_cache = {}            # path → original cv2 image
         self._active_filter = filter_original
+        self._line_rects = []
+        self._char_rects = []
+        self._show_lines = False
+        self._show_chars = False
 
         self._build_menu()
         self._build_central()
@@ -454,7 +564,11 @@ class MainWindow(QMainWindow):
         scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         scroll.setStyleSheet(f"border: none; background: {C_BG};")
 
-        self._filter_bar = FilterBar(on_filter_changed=self._on_filter_changed)
+        self._filter_bar = FilterBar(
+            on_filter_changed=self._on_filter_changed,
+            on_lines_toggled=self._on_lines_toggled,
+            on_chars_toggled=self._on_chars_toggled,
+        )
         self._sidebar = Sidebar(on_select=self._on_image_selected)
 
         right = QWidget()
@@ -490,32 +604,69 @@ class MainWindow(QMainWindow):
                 self._cv_cache[path] = img
         return self._cv_cache.get(path)
 
-    def _apply_and_show(self, path, filter_fn):
-        img = self._load_cv(path)
+    def _refresh_view(self):
+        if not self._current_path:
+            return
+        img = self._load_cv(self._current_path)
         if img is None:
             return
-        result = filter_fn(img)
+        result = self._active_filter(img)
+        result = draw_overlays(result, self._line_rects, self._char_rects,
+                               self._show_lines, self._show_chars)
         self._viewer.set_pixmap(cv_to_pixmap(result))
         h, w = img.shape[:2]
-        filter_name = next(f[0] for f in FILTERS if f[2] == filter_fn)
-        self._status.showMessage(
-            f"{os.path.basename(path)}  —  {w}×{h}px  —  Filter: {filter_name}"
-        )
+        filter_name = next(f[0] for f in FILTERS if f[2] == self._active_filter)
+        parts = [os.path.basename(self._current_path), f"{w}×{h}px",
+                 f"Filter: {filter_name}"]
+        if self._show_lines:
+            parts.append(f"Lines: {len(self._line_rects)}")
+        if self._show_chars:
+            parts.append(f"Chars: {len(self._char_rects)}")
+        self._status.showMessage("  —  ".join(parts))
 
     def _on_image_selected(self, path):
         self._current_path = path
+        self._line_rects = []
+        self._char_rects = []
         if path is None:
             self._viewer.set_pixmap(None)
             self._status.showMessage("Ready")
             self.setWindowTitle("Font Generator")
             return
-        self._apply_and_show(path, self._active_filter)
+        if self._show_lines:
+            self._line_rects = detect_lines(self._load_cv(path))
+        if self._show_chars:
+            self._char_rects = detect_characters(self._load_cv(path), self._line_rects)
+        self._refresh_view()
         self.setWindowTitle(f"Font Generator — {os.path.basename(path)}")
 
     def _on_filter_changed(self, filter_fn):
         self._active_filter = filter_fn
-        if self._current_path:
-            self._apply_and_show(self._current_path, filter_fn)
+        self._refresh_view()
+
+    def _on_lines_toggled(self, checked):
+        self._show_lines = checked
+        if self._current_path and checked:
+            self._line_rects = detect_lines(self._load_cv(self._current_path))
+            if self._show_chars:
+                self._char_rects = detect_characters(
+                    self._load_cv(self._current_path), self._line_rects)
+        elif not checked:
+            self._line_rects = []
+            self._char_rects = []
+        self._refresh_view()
+
+    def _on_chars_toggled(self, checked):
+        self._show_chars = checked
+        if self._current_path and checked:
+            if not self._line_rects:
+                self._line_rects = detect_lines(self._load_cv(self._current_path))
+                self._show_lines = True
+            self._char_rects = detect_characters(
+                self._load_cv(self._current_path), self._line_rects)
+        elif not checked:
+            self._char_rects = []
+        self._refresh_view()
 
 
 def main():
