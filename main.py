@@ -965,22 +965,54 @@ class Sidebar(QWidget):
 # ── Image viewer ───────────────────────────────────────────────────────────
 
 class ImageViewer(QLabel):
-    pixel_clicked       = pyqtSignal(float, float)   # image x, y  (left click)
-    right_clicked       = pyqtSignal()
-    drag_started        = pyqtSignal(float, float)   # image x, y
-    drag_moved          = pyqtSignal(float, float)   # delta image dx, dy
+    pixel_clicked = pyqtSignal(float, float)
+    right_clicked = pyqtSignal()
+    drag_started  = pyqtSignal(float, float)
+    drag_moved    = pyqtSignal(float, float)
+
+    ZOOM_MIN = 0.05
+    ZOOM_MAX = 10.0
+    ZOOM_STEP = 1.25
 
     def __init__(self):
         super().__init__()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._pixmap       = None
-        self._origin       = (0, 0)   # top-left of displayed region in image coords
-        self._drag_last    = None
+        self._pixmap      = None   # base (unscaled) pixmap
+        self._origin      = (0, 0)
+        self._drag_last   = None
+        self._zoom        = 1.0
+        self._zoom_enabled = True
+        self._sa          = None   # QScrollArea reference
         self._show_placeholder()
+
+    # ── public API ──────────────────────────────────────────────────────────
+
+    def set_scroll_area(self, sa):
+        self._sa = sa
+
+    def set_zoom_enabled(self, enabled):
+        self._zoom_enabled = enabled
+        if not enabled:
+            self._reset_zoom()
+
+    def reset_zoom(self):
+        self._reset_zoom()
 
     def set_display_origin(self, ox, oy):
         self._origin = (ox, oy)
+
+    def set_pixmap(self, pixmap):
+        if pixmap is None or pixmap.isNull():
+            self._pixmap = None
+            self._reset_zoom(render=False)
+            self._show_placeholder()
+            return
+        self._pixmap = pixmap
+        self.setStyleSheet(f"background: {C_BG};")
+        self._render()
+
+    # ── coordinate mapping ───────────────────────────────────────────────────
 
     def widget_to_image(self, wx, wy):
         if not self._pixmap or self._pixmap.isNull():
@@ -990,22 +1022,44 @@ class ImageViewer(QLabel):
         scale  = min(vw / pw, vh / ph)
         offx   = (vw - pw * scale) / 2
         offy   = (vh - ph * scale) / 2
-        ix = (wx - offx) / scale + self._origin[0]
-        iy = (wy - offy) / scale + self._origin[1]
-        return ix, iy
+        return (wx - offx) / scale + self._origin[0], \
+               (wy - offy) / scale + self._origin[1]
+
+    # ── internal rendering ───────────────────────────────────────────────────
 
     def _show_placeholder(self):
         self.setText("Add images using the sidebar\n\nCtrl+O  or  click  + Add")
         self.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 16px; background: {C_BG};")
 
-    def set_pixmap(self, pixmap):
-        if pixmap is None or pixmap.isNull():
-            self._pixmap = None
-            self._show_placeholder()
+    def _reset_zoom(self, render=True):
+        self._zoom = 1.0
+        if self._sa:
+            self._sa.setWidgetResizable(True)
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        if render:
+            self._render()
+
+    def _render(self):
+        if not self._pixmap:
             return
-        self._pixmap = pixmap
-        self.setStyleSheet(f"background: {C_BG};")
-        self._fit()
+        if self._zoom == 1.0:
+            if self._sa:
+                self._sa.setWidgetResizable(True)
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(16777215, 16777215)
+            self._fit()
+        else:
+            if self._sa:
+                self._sa.setWidgetResizable(False)
+            w = int(self._pixmap.width()  * self._zoom)
+            h = int(self._pixmap.height() * self._zoom)
+            self.setFixedSize(w, h)
+            self.setPixmap(self._pixmap.scaled(
+                w, h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            ))
 
     def _fit(self):
         if self._pixmap:
@@ -1016,8 +1070,51 @@ class ImageViewer(QLabel):
             ))
 
     def resizeEvent(self, event):
-        self._fit()
+        if self._zoom == 1.0:
+            self._fit()
         super().resizeEvent(event)
+
+    # ── zoom ─────────────────────────────────────────────────────────────────
+
+    def wheelEvent(self, e):
+        if not self._zoom_enabled or not self._pixmap:
+            super().wheelEvent(e)
+            return
+
+        factor   = self.ZOOM_STEP if e.angleDelta().y() > 0 else 1 / self.ZOOM_STEP
+        old_zoom = self._zoom
+        new_zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, old_zoom * factor))
+        if new_zoom == old_zoom:
+            return
+
+        mx, my = e.position().x(), e.position().y()
+
+        if old_zoom == 1.0:
+            # Currently fit-to-view — compute effective render scale
+            pw, ph = self._pixmap.width(), self._pixmap.height()
+            eff    = min(self.width() / pw, self.height() / ph)
+            offx   = (self.width()  - pw * eff) / 2
+            offy   = (self.height() - ph * eff) / 2
+            img_x  = (mx - offx) / eff
+            img_y  = (my - offy) / eff
+            self._zoom = new_zoom
+            self._render()
+            if self._sa:
+                self._sa.horizontalScrollBar().setValue(int(img_x * new_zoom - mx))
+                self._sa.verticalScrollBar().setValue(int(img_y * new_zoom - my))
+        else:
+            if self._sa:
+                sx = self._sa.horizontalScrollBar().value()
+                sy = self._sa.verticalScrollBar().value()
+                img_x = (sx + mx) / old_zoom
+                img_y = (sy + my) / old_zoom
+            self._zoom = new_zoom
+            self._render()
+            if self._sa:
+                self._sa.horizontalScrollBar().setValue(int(img_x * new_zoom - mx))
+                self._sa.verticalScrollBar().setValue(int(img_y * new_zoom - my))
+
+        e.accept()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.RightButton:
@@ -1264,6 +1361,12 @@ class MainWindow(QMainWindow):
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
+        view_menu = menu.addMenu("&View")
+        reset_zoom_act = QAction("Reset Zoom", self)
+        reset_zoom_act.setShortcut("Ctrl+0")
+        reset_zoom_act.triggered.connect(lambda: self._viewer.reset_zoom())
+        view_menu.addAction(reset_zoom_act)
+
         detect_menu = menu.addMenu("&Detection")
         settings_act = QAction("&Settings...", self)
         settings_act.setShortcut("Ctrl+,")
@@ -1282,6 +1385,7 @@ class MainWindow(QMainWindow):
         self._scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._scroll.setStyleSheet(f"border: none; background: {C_BG};")
         scroll = self._scroll
+        self._viewer.set_scroll_area(self._scroll)
 
         self._assign_panel = AssignmentPanel()
         self._assign_panel.width_changed.connect(self._on_assign_width)
@@ -1416,6 +1520,7 @@ class MainWindow(QMainWindow):
         self._assign_panel.set_rect(self._selected_rect[2], self._selected_rect[3])
         self._assign_panel.set_angle(0)
         self._assign_panel.show()
+        self._viewer.set_zoom_enabled(False)
         self._alphabet_bar._return_btn.setEnabled(True)
         self._viewer.setCursor(Qt.CursorShape.SizeAllCursor)
         self._render_assignment()
@@ -1436,6 +1541,7 @@ class MainWindow(QMainWindow):
         self._alphabet_bar._return_btn.setEnabled(False)
         self._viewer.set_display_origin(0, 0)
         self._viewer.setCursor(Qt.CursorShape.ArrowCursor)
+        self._viewer.set_zoom_enabled(True)
         self._refresh_view()
 
     def _render_assignment(self):
