@@ -820,12 +820,34 @@ class Sidebar(QWidget):
 # ── Image viewer ───────────────────────────────────────────────────────────
 
 class ImageViewer(QLabel):
+    pixel_clicked       = pyqtSignal(float, float)   # image x, y  (left click)
+    right_clicked       = pyqtSignal()
+    drag_started        = pyqtSignal(float, float)   # image x, y
+    drag_moved          = pyqtSignal(float, float)   # delta image dx, dy
+
     def __init__(self):
         super().__init__()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._pixmap = None
+        self._pixmap       = None
+        self._origin       = (0, 0)   # top-left of displayed region in image coords
+        self._drag_last    = None
         self._show_placeholder()
+
+    def set_display_origin(self, ox, oy):
+        self._origin = (ox, oy)
+
+    def widget_to_image(self, wx, wy):
+        if not self._pixmap or self._pixmap.isNull():
+            return -1.0, -1.0
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        vw, vh = self.width(), self.height()
+        scale  = min(vw / pw, vh / ph)
+        offx   = (vw - pw * scale) / 2
+        offy   = (vh - ph * scale) / 2
+        ix = (wx - offx) / scale + self._origin[0]
+        iy = (wy - offy) / scale + self._origin[1]
+        return ix, iy
 
     def _show_placeholder(self):
         self.setText("Add images using the sidebar\n\nCtrl+O  or  click  + Add")
@@ -852,6 +874,139 @@ class ImageViewer(QLabel):
         self._fit()
         super().resizeEvent(event)
 
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            self.right_clicked.emit()
+        elif e.button() == Qt.MouseButton.LeftButton:
+            ix, iy = self.widget_to_image(e.position().x(), e.position().y())
+            self._drag_last = (e.position().x(), e.position().y())
+            self.pixel_clicked.emit(ix, iy)
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_last and e.buttons() & Qt.MouseButton.LeftButton:
+            dx_w = e.position().x() - self._drag_last[0]
+            dy_w = e.position().y() - self._drag_last[1]
+            if not self._pixmap or self._pixmap.isNull():
+                return
+            pw, ph = self._pixmap.width(), self._pixmap.height()
+            scale  = min(self.width() / pw, self.height() / ph)
+            self.drag_moved.emit(dx_w / scale, dy_w / scale)
+            self._drag_last = (e.position().x(), e.position().y())
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_last = None
+        super().mouseReleaseEvent(e)
+
+
+# ── Assignment panel ────────────────────────────────────────────────────────
+
+class AssignmentPanel(QWidget):
+    width_changed  = pyqtSignal(int)
+    height_changed = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(200)
+        self.setStyleSheet(
+            f"background: {C_SIDEBAR}; border-left: 1px solid {C_BORDER};"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(14)
+
+        title = QLabel("Selection")
+        title.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {C_TEXT};")
+        layout.addWidget(title)
+
+        # Preview
+        self._preview = QLabel()
+        self._preview.setFixedSize(172, 100)
+        self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview.setStyleSheet(
+            f"border: 1px solid {C_BORDER}; background: {C_BG}; border-radius: 4px;"
+        )
+        layout.addWidget(self._preview)
+
+        # Width slider
+        layout.addWidget(self._section("Width"))
+        self._w_slider, self._w_label = self._make_slider()
+        self._w_slider.valueChanged.connect(self._on_w)
+        layout.addWidget(self._w_slider)
+        layout.addWidget(self._w_label)
+
+        # Height slider
+        layout.addWidget(self._section("Height"))
+        self._h_slider, self._h_label = self._make_slider()
+        self._h_slider.valueChanged.connect(self._on_h)
+        layout.addWidget(self._h_slider)
+        layout.addWidget(self._h_label)
+
+        hint = QLabel("Click a letter below\nto assign this crop")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setStyleSheet(
+            f"color: {C_TEXT_MUTED}; font-size: 11px; "
+            f"border: 1px dashed {C_BORDER}; border-radius: 4px; padding: 8px;"
+        )
+        layout.addWidget(hint)
+        layout.addStretch()
+
+    def _section(self, text):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: bold;")
+        return lbl
+
+    def _make_slider(self):
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(4, 800)
+        slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                height: 4px; background: {C_BORDER}; border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {C_SELECTED}; width: 14px; height: 14px;
+                margin: -5px 0; border-radius: 7px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {C_SELECTED}; border-radius: 2px;
+            }}
+        """)
+        label = QLabel("—")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet(f"color: {C_SELECTED}; font-weight: bold; font-size: 12px;")
+        return slider, label
+
+    def _on_w(self, v):
+        self._w_label.setText(f"{v} px")
+        self.width_changed.emit(v)
+
+    def _on_h(self, v):
+        self._h_label.setText(f"{v} px")
+        self.height_changed.emit(v)
+
+    def set_rect(self, w, h):
+        self._w_slider.blockSignals(True)
+        self._h_slider.blockSignals(True)
+        self._w_slider.setValue(int(w))
+        self._h_slider.setValue(int(h))
+        self._w_label.setText(f"{int(w)} px")
+        self._h_label.setText(f"{int(h)} px")
+        self._w_slider.blockSignals(False)
+        self._h_slider.blockSignals(False)
+
+    def set_preview(self, img_crop):
+        if img_crop is None or img_crop.size == 0:
+            self._preview.clear()
+            return
+        px = cv_to_pixmap(img_crop)
+        self._preview.setPixmap(px.scaled(
+            self._preview.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ))
+
 
 # ── Main window ────────────────────────────────────────────────────────────
 
@@ -863,12 +1018,17 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(f"background: {C_BG};")
 
         self._current_path = None
-        self._cv_cache = {}
-        self._line_rects = []
-        self._char_rects = []
-        self._show_chars = False
+        self._cv_cache     = {}
+        self._line_rects   = []
+        self._char_rects   = []
+        self._show_chars   = False
         self._seg_settings = SegmentationSettings()
         self._settings_dialog = None
+        # assignment mode
+        self._mode          = "normal"
+        self._selected_rect = None     # [x, y, w, h] mutable
+        self._zoom_origin   = (0, 0)   # crop top-left in image coords
+        self._assigned      = {}       # letter_name → list of np.ndarray
 
         self._build_menu()
         self._build_central()
@@ -898,6 +1058,9 @@ class MainWindow(QMainWindow):
 
     def _build_central(self):
         self._viewer = ImageViewer()
+        self._viewer.pixel_clicked.connect(self._on_viewer_click)
+        self._viewer.right_clicked.connect(self._exit_assignment)
+        self._viewer.drag_moved.connect(self._on_viewer_drag)
 
         scroll = QScrollArea()
         scroll.setWidget(self._viewer)
@@ -905,19 +1068,33 @@ class MainWindow(QMainWindow):
         scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         scroll.setStyleSheet(f"border: none; background: {C_BG};")
 
+        self._assign_panel = AssignmentPanel()
+        self._assign_panel.width_changed.connect(self._on_assign_width)
+        self._assign_panel.height_changed.connect(self._on_assign_height)
+        self._assign_panel.hide()
+
+        view_row = QWidget()
+        view_row_layout = QHBoxLayout(view_row)
+        view_row_layout.setContentsMargins(0, 0, 0, 0)
+        view_row_layout.setSpacing(0)
+        view_row_layout.addWidget(scroll)
+        view_row_layout.addWidget(self._assign_panel)
+
         self._filter_bar = FilterBar(
             on_filter_changed=self._on_filter_changed,
             on_chars_toggled=self._on_chars_toggled,
         )
         self._sidebar = Sidebar(on_select=self._on_image_selected)
         self._alphabet_bar = HebrewAlphabetBar(on_letter_clicked=self._on_letter_clicked)
+        self._alphabet_bar._return_btn.setEnabled(False)
+        self._alphabet_bar._return_btn.clicked.connect(self._exit_assignment)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
         right_layout.addWidget(self._filter_bar)
-        right_layout.addWidget(scroll)
+        right_layout.addWidget(view_row)
         right_layout.addWidget(self._alphabet_bar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -996,11 +1173,128 @@ class MainWindow(QMainWindow):
             self._char_rects = []
         self._refresh_view()
 
+    # ── Assignment mode ────────────────────────────────────────────────────
+
+    def _on_viewer_click(self, ix, iy):
+        if self._mode == "assignment":
+            return
+        if not self._char_rects:
+            return
+        # Find which rect was clicked
+        for i, (x, y, w, h) in enumerate(self._char_rects):
+            if x <= ix <= x + w and y <= iy <= y + h:
+                self._enter_assignment(i)
+                return
+
+    def _enter_assignment(self, rect_idx):
+        self._mode = "assignment"
+        self._selected_rect = list(self._char_rects[rect_idx])
+        self._assign_panel.set_rect(self._selected_rect[2], self._selected_rect[3])
+        self._assign_panel.show()
+        self._alphabet_bar._return_btn.setEnabled(True)
+        self._viewer.setCursor(Qt.CursorShape.SizeAllCursor)
+        self._render_assignment()
+
+    def _exit_assignment(self):
+        if self._mode != "assignment":
+            return
+        self._mode = "normal"
+        self._selected_rect = None
+        self._zoom_origin = (0, 0)
+        self._assign_panel.hide()
+        self._alphabet_bar._return_btn.setEnabled(False)
+        self._viewer.set_display_origin(0, 0)
+        self._viewer.setCursor(Qt.CursorShape.ArrowCursor)
+        self._refresh_view()
+
+    def _render_assignment(self):
+        if not self._current_path or self._selected_rect is None:
+            return
+        img = self._load_cv(self._current_path)
+        filtered = self._apply_filters(img)
+        x, y, w, h = [int(v) for v in self._selected_rect]
+        ih, iw = filtered.shape[:2]
+
+        PAD = max(80, w, h)
+        x1 = max(0, x - PAD)
+        y1 = max(0, y - PAD)
+        x2 = min(iw, x + w + PAD)
+        y2 = min(ih, y + h + PAD)
+        self._zoom_origin = (x1, y1)
+        self._viewer.set_display_origin(x1, y1)
+
+        crop = filtered[y1:y2, x1:x2].copy()
+        if len(crop.shape) == 2:
+            crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+        rx, ry = x - x1, y - y1
+        # Dim everything outside the selection
+        overlay = crop.copy()
+        overlay[:, :] = (overlay * 0.4).astype(np.uint8)
+        overlay[ry:ry+h, rx:rx+w] = crop[ry:ry+h, rx:rx+w]
+        cv2.rectangle(overlay, (rx, ry), (rx+w, ry+h), (30, 120, 220), 2)
+
+        self._viewer.set_pixmap(cv_to_pixmap(overlay))
+
+        # Preview in panel
+        char_crop = filtered[y:y+h, x:x+w] if h > 0 and w > 0 else None
+        self._assign_panel.set_preview(char_crop)
+        self._status.showMessage(
+            f"Assignment mode  —  rect {w}×{h}px  —  drag to reposition  |  "
+            f"right-click or ← Back to exit"
+        )
+
+    def _on_viewer_drag(self, dx, dy):
+        if self._mode != "assignment" or self._selected_rect is None:
+            return
+        img = self._load_cv(self._current_path)
+        ih, iw = img.shape[:2]
+        x, y, w, h = self._selected_rect
+        x = max(0, min(iw - w, x + dx))
+        y = max(0, min(ih - h, y + dy))
+        self._selected_rect[0] = x
+        self._selected_rect[1] = y
+        self._render_assignment()
+
+    def _on_assign_width(self, val):
+        if self._selected_rect:
+            self._selected_rect[2] = val
+            self._render_assignment()
+
+    def _on_assign_height(self, val):
+        if self._selected_rect:
+            self._selected_rect[3] = val
+            self._render_assignment()
+
     def _on_letter_clicked(self, name):
-        # Preview mode will be implemented later
+        if self._mode != "assignment":
+            entry = next((e for e in HEBREW_ALPHABET if e[0] == name), None)
+            if entry:
+                self._status.showMessage(
+                    f"Letter: {entry[2]} ({entry[1]}) — enable character detection first")
+            return
+
+        # Assign current crop to letter
+        img = self._load_cv(self._current_path)
+        filtered = self._apply_filters(img)
+        x, y, w, h = [int(v) for v in self._selected_rect]
+        ih, iw = filtered.shape[:2]
+        x = max(0, min(iw - 1, x));  y = max(0, min(ih - 1, y))
+        x2 = min(iw, x + w);         y2 = min(ih, y + h)
+        crop = filtered[y:y2, x:x2].copy()
+
+        if name not in self._assigned:
+            self._assigned[name] = []
+        self._assigned[name].append(crop)
+
+        tile = self._alphabet_bar.tile(name)
+        if tile:
+            tile.set_has_images(True)
+
         entry = next((e for e in HEBREW_ALPHABET if e[0] == name), None)
-        if entry:
-            self._status.showMessage(f"Letter: {entry[2]}  ({entry[1]})  — selection mechanism coming soon")
+        label = entry[2] if entry else name
+        self._status.showMessage(
+            f"✓ Assigned to {label} — total: {len(self._assigned[name])} sample(s)"
+        )
 
     def _open_settings(self):
         if self._settings_dialog is None:
