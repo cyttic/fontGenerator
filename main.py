@@ -1002,7 +1002,7 @@ class Sidebar(QWidget):
         )
 
         self._images_panel = _ListPanel(
-            "Images", on_select,
+            "Images", self._on_images_select,
             buttons=[
                 ("+ Add",    C_BTN_ADD, C_BTN_ADD_H, self._add_images),
                 ("− Remove", C_BTN_REM, C_BTN_REM_H, self._remove_image),
@@ -1010,7 +1010,7 @@ class Sidebar(QWidget):
         )
 
         self._layers_panel = _ListPanel(
-            "Layers", on_select,
+            "Layers", self._on_layers_select,
             buttons=[
                 ("− Remove", C_BTN_REM, C_BTN_REM_H, self._remove_layer),
             ]
@@ -1021,6 +1021,22 @@ class Sidebar(QWidget):
         splitter.setSizes([400, 200])
 
         layout.addWidget(splitter)
+
+    def _on_images_select(self, path):
+        if path:
+            self._layers_panel.list_widget.blockSignals(True)
+            self._layers_panel.list_widget.clearSelection()
+            self._layers_panel.list_widget.setCurrentRow(-1)
+            self._layers_panel.list_widget.blockSignals(False)
+        self.on_select(path)
+
+    def _on_layers_select(self, path):
+        if path:
+            self._images_panel.list_widget.blockSignals(True)
+            self._images_panel.list_widget.clearSelection()
+            self._images_panel.list_widget.setCurrentRow(-1)
+            self._images_panel.list_widget.blockSignals(False)
+        self.on_select(path)
 
     def _add_images(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1036,7 +1052,6 @@ class Sidebar(QWidget):
     def _remove_layer(self):
         self._layers_panel.remove_selected()
 
-    # Public helpers used by MainWindow
     def add_images(self):
         self._add_images()
 
@@ -1805,7 +1820,7 @@ class MainWindow(QMainWindow):
         if img is None:
             return
         filtered = self._apply_filters(img)
-        result = draw_overlays(filtered, self._char_rects, self._show_chars)
+        result = filtered
 
         os.makedirs(LAYERS_DIR, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
