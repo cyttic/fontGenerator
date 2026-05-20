@@ -150,13 +150,10 @@ def detect_characters(img, line_rects):
     return rects
 
 
-def draw_overlays(img, line_rects, char_rects, show_lines, show_chars):
+def draw_overlays(img, char_rects, show_chars):
     out = img.copy()
     if len(out.shape) == 2:
         out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
-    if show_lines:
-        for (x, y, w, h) in line_rects:
-            cv2.rectangle(out, (x, y), (x + w, y + h), (34, 160, 34), 2)
     if show_chars:
         for (x, y, w, h) in char_rects:
             cv2.rectangle(out, (x, y), (x + w, y + h), (30, 100, 220), 1)
@@ -234,15 +231,6 @@ def icon_deskew(p, s):
     p.drawLine(3, s // 2, s - 3, s // 2)
 
 
-def icon_lines(p, s):
-    # Three horizontal rectangles representing text lines
-    p.setPen(Qt.PenStyle.NoPen)
-    for i, y in enumerate([4, 11, 18]):
-        color = QColor("#22a022") if i == 1 else QColor("#aaddaa")
-        p.setBrush(QBrush(color))
-        p.drawRect(QRect(2, y, s - 4, 5))
-
-
 def icon_characters(p, s):
     # Small rectangles representing individual characters
     p.setPen(QPen(QColor("#2264e0"), 1))
@@ -265,7 +253,7 @@ FILTERS = [
 
 
 class FilterBar(QWidget):
-    def __init__(self, on_filter_changed, on_lines_toggled, on_chars_toggled, parent=None):
+    def __init__(self, on_filter_changed, on_chars_toggled, parent=None):
         super().__init__(parent)
         self.on_filter_changed = on_filter_changed
         self.setFixedHeight(52)
@@ -310,13 +298,9 @@ class FilterBar(QWidget):
         seg_label.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: bold;")
         layout.addWidget(seg_label)
 
-        self._btn_lines = self._make_seg_btn(
-            icon_lines, "<b>Find Lines</b><br>Detect text line boundaries", on_lines_toggled
-        )
         self._btn_chars = self._make_seg_btn(
             icon_characters, "<b>Find Characters</b><br>Detect individual character boundaries", on_chars_toggled
         )
-        layout.addWidget(self._btn_lines)
         layout.addWidget(self._btn_chars)
         layout.addStretch()
 
@@ -532,7 +516,6 @@ class MainWindow(QMainWindow):
         self._active_filter = filter_original
         self._line_rects = []
         self._char_rects = []
-        self._show_lines = False
         self._show_chars = False
 
         self._build_menu()
@@ -566,7 +549,6 @@ class MainWindow(QMainWindow):
 
         self._filter_bar = FilterBar(
             on_filter_changed=self._on_filter_changed,
-            on_lines_toggled=self._on_lines_toggled,
             on_chars_toggled=self._on_chars_toggled,
         )
         self._sidebar = Sidebar(on_select=self._on_image_selected)
@@ -611,15 +593,12 @@ class MainWindow(QMainWindow):
         if img is None:
             return
         result = self._active_filter(img)
-        result = draw_overlays(result, self._line_rects, self._char_rects,
-                               self._show_lines, self._show_chars)
+        result = draw_overlays(result, self._char_rects, self._show_chars)
         self._viewer.set_pixmap(cv_to_pixmap(result))
         h, w = img.shape[:2]
         filter_name = next(f[0] for f in FILTERS if f[2] == self._active_filter)
         parts = [os.path.basename(self._current_path), f"{w}×{h}px",
                  f"Filter: {filter_name}"]
-        if self._show_lines:
-            parts.append(f"Lines: {len(self._line_rects)}")
         if self._show_chars:
             parts.append(f"Chars: {len(self._char_rects)}")
         self._status.showMessage("  —  ".join(parts))
@@ -633,9 +612,8 @@ class MainWindow(QMainWindow):
             self._status.showMessage("Ready")
             self.setWindowTitle("Font Generator")
             return
-        if self._show_lines:
-            self._line_rects = detect_lines(self._load_cv(path))
         if self._show_chars:
+            self._line_rects = detect_lines(self._load_cv(path))
             self._char_rects = detect_characters(self._load_cv(path), self._line_rects)
         self._refresh_view()
         self.setWindowTitle(f"Font Generator — {os.path.basename(path)}")
@@ -644,27 +622,14 @@ class MainWindow(QMainWindow):
         self._active_filter = filter_fn
         self._refresh_view()
 
-    def _on_lines_toggled(self, checked):
-        self._show_lines = checked
-        if self._current_path and checked:
-            self._line_rects = detect_lines(self._load_cv(self._current_path))
-            if self._show_chars:
-                self._char_rects = detect_characters(
-                    self._load_cv(self._current_path), self._line_rects)
-        elif not checked:
-            self._line_rects = []
-            self._char_rects = []
-        self._refresh_view()
-
     def _on_chars_toggled(self, checked):
         self._show_chars = checked
         if self._current_path and checked:
-            if not self._line_rects:
-                self._line_rects = detect_lines(self._load_cv(self._current_path))
-                self._show_lines = True
+            self._line_rects = detect_lines(self._load_cv(self._current_path))
             self._char_rects = detect_characters(
                 self._load_cv(self._current_path), self._line_rects)
         elif not checked:
+            self._line_rects = []
             self._char_rects = []
         self._refresh_view()
 
