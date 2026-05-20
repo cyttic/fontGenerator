@@ -135,7 +135,8 @@ def filter_deskew(img):
     return cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
 
 
-_active_char_rects = []   # set by MainWindow before calling filters
+_active_char_rects   = []    # set by MainWindow before calling filters
+_active_seg_settings = None  # set by MainWindow before calling filters
 
 
 def filter_isolate_chars(img):
@@ -156,6 +157,24 @@ def filter_remove_chars(img):
         y2, x2 = min(y + h, img.shape[0]), min(x + w, img.shape[1])
         result[y:y2, x:x2] = 255
     return result
+
+
+def filter_binarize(img):
+    """Binarize using the method and threshold from Detection Settings."""
+    s = _active_seg_settings
+    if s is None:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        _, result = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        if s.threshold_method == "manual":
+            _, result = cv2.threshold(gray, s.manual_threshold, 255, cv2.THRESH_BINARY)
+        elif s.threshold_method == "adaptive":
+            result = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10)
+        else:
+            _, result = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
 
 
 # ── Segmentation settings ─────────────────────────────────────────────────
@@ -303,6 +322,17 @@ def icon_deskew(p, s):
     p.drawLine(3, s - 6, s - 3, 5)
     p.setPen(QPen(QColor("#333"), 2))
     p.drawLine(3, s // 2, s - 3, s // 2)
+
+
+def icon_binarize(p, s):
+    # Left half dark gray gradient, right half pure black/white split
+    for i in range(s // 2 - 1):
+        v = int(80 + i * (160 / (s // 2)))
+        p.fillRect(QRect(2 + i, 2, 1, s - 4), QColor(v, v, v))
+    p.fillRect(QRect(s // 2, 2, s // 2 - 2, (s - 4) // 2), QColor("#000"))
+    p.fillRect(QRect(s // 2, 2 + (s - 4) // 2, s // 2 - 2, (s - 4) // 2), QColor("#fff"))
+    p.setPen(QPen(QColor(C_BORDER), 1))
+    p.drawLine(s // 2, 2, s // 2, s - 2)
 
 
 def icon_isolate(p, s):
@@ -514,7 +544,8 @@ FILTERS = [
     ("Adaptive",   icon_adaptive,  filter_adaptive,  "Adaptive threshold binarization"),
     ("CLAHE",      icon_clahe,     filter_clahe,     "Contrast enhancement (CLAHE)"),
     ("Denoise",    icon_denoise,   filter_denoise,   "Noise removal (median + morphology)"),
-    ("Deskew",    icon_deskew,   filter_deskew,        "Auto deskew correction"),
+    ("Deskew",    icon_deskew,     filter_deskew,        "Auto deskew correction"),
+    ("Binarize",  icon_binarize,   filter_binarize,      "Binarize using method and threshold from Detection Settings"),
     ("Isolate",  icon_isolate,       filter_isolate_chars, "Show only detected characters on white background"),
     ("Erase",    icon_remove_chars,  filter_remove_chars,  "Remove detected characters, keep background"),
 ]
@@ -1575,8 +1606,9 @@ class MainWindow(QMainWindow):
         return self._cv_cache.get(path)
 
     def _apply_filters(self, img):
-        global _active_char_rects
-        _active_char_rects = self._char_rects
+        global _active_char_rects, _active_seg_settings
+        _active_char_rects   = self._char_rects
+        _active_seg_settings = self._seg_settings
         fns = self._filter_bar.active_filters()
         result = img.copy()
         for fn in fns:
@@ -1591,8 +1623,8 @@ class MainWindow(QMainWindow):
             return
         filtered = self._apply_filters(img)
         if self._show_chars:
-            self._line_rects = detect_lines(filtered, self._seg_settings)
-            self._char_rects = detect_characters(filtered, self._line_rects, self._seg_settings)
+            self._line_rects = detect_lines(img, self._seg_settings)
+            self._char_rects = detect_characters(img, self._line_rects, self._seg_settings)
         result = draw_overlays(filtered, self._char_rects, self._show_chars)
         self._viewer.set_pixmap(cv_to_pixmap(result))
         h, w = img.shape[:2]

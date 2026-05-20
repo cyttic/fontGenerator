@@ -1,13 +1,13 @@
 {
-  "threshold_method": "otsu",
-  "manual_threshold": 42,
-  "line_kernel_width": 52,
-  "line_threshold_pct": 5,
-  "min_area": 39,
-  "max_area": 256,
-  "min_width": 8,
+  "threshold_method": "manual",
+  "manual_threshold": 147,
+  "line_kernel_width": 65,
+  "line_threshold_pct": 2,
+  "min_area": 5,
+  "max_area": 1351,
+  "min_width": 1,
   "min_height": 6,
-  "max_width": 323,
+  "max_width": 135,
   "max_height": 218,
   "connectivity": 8
 }
