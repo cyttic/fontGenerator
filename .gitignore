@@ -1,0 +1,14 @@
+# Saved layers
+layers/
+
+# User settings
+settings.json
+
+# Generated fonts
+*.ttf
+*.otf
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

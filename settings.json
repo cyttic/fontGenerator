@@ -1,13 +1,13 @@
 {
   "threshold_method": "manual",
-  "manual_threshold": 121,
+  "manual_threshold": 144,
   "line_kernel_width": 120,
-  "line_threshold_pct": 8,
+  "line_threshold_pct": 1,
   "min_area": 5,
   "max_area": 1351,
   "min_width": 1,
-  "min_height": 6,
+  "min_height": 1,
   "max_width": 135,
-  "max_height": 218,
-  "connectivity": 8
+  "max_height": 281,
+  "connectivity": 4
 }

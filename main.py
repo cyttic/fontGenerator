@@ -1961,13 +1961,115 @@ class MainWindow(QMainWindow):
         missing = [label for name, _, label in HEBREW_ALPHABET
                    if not self._assigned.get(name)]
         if missing:
-            self._status.showMessage(
-                f"Missing letters: {', '.join(missing)}")
+            self._status.showMessage(f"Missing letters: {', '.join(missing)}")
             return
-        # Font creation will be implemented here
-        self._status.showMessage(
-            f"Ready to create font — {len(HEBREW_ALPHABET)} letters, "
-            f"{sum(len(v) for v in self._assigned.values())} total samples")
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Font As", "hebrew_handwritten.ttf",
+            "TrueType Font (*.ttf)"
+        )
+        if not out_path:
+            return
+
+        self._status.showMessage("Building font…")
+        QApplication.processEvents()
+
+        try:
+            self._build_ttf(out_path)
+            self._status.showMessage(f"Font saved: {out_path}")
+        except Exception as ex:
+            self._status.showMessage(f"Font creation failed: {ex}")
+
+    def _build_ttf(self, out_path):
+        from fontTools.fontBuilder import FontBuilder
+        from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+        UPM        = 1000
+        ASCENDER   = 800
+        DESCENDER  = -200
+        CAP_HEIGHT = 600
+        BASELINE   = 100
+
+        cmap_map   = {0x0020: "space"}
+        glyph_order = [".notdef", "space"]
+        glyphs     = {}
+        metrics    = {}
+
+        # .notdef — empty box
+        pen = TTGlyphPen(None)
+        pen.moveTo((50, 0));  pen.lineTo((50, 700))
+        pen.lineTo((450, 700)); pen.lineTo((450, 0)); pen.closePath()
+        pen.moveTo((400, 50)); pen.lineTo((400, 650))
+        pen.lineTo((100, 650)); pen.lineTo((100, 50)); pen.closePath()
+        glyphs[".notdef"] = pen.glyph(); metrics[".notdef"] = (500, 50)
+
+        glyphs["space"] = TTGlyphPen(None).glyph(); metrics["space"] = (250, 0)
+
+        for name, char, _ in HEBREW_ALPHABET:
+            glyph_order.append(name)
+            cmap_map[ord(char)] = name
+            imgs = self._assigned.get(name, [])
+            img  = imgs[0] if imgs else None
+
+            if img is None or img.size == 0:
+                glyphs[name] = TTGlyphPen(None).glyph()
+                metrics[name] = (500, 0)
+                continue
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) \
+                   if len(img.shape) == 3 else img
+            _, binary = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+            ih, iw   = binary.shape
+            scale    = CAP_HEIGHT / ih
+            contours, hierarchy = cv2.findContours(
+                binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+            pen = TTGlyphPen(None)
+            if hierarchy is not None and len(contours) > 0:
+                hierarchy = hierarchy[0]
+                for i, contour in enumerate(contours):
+                    eps   = max(1.0, 0.008 * cv2.arcLength(contour, True))
+                    approx = cv2.approxPolyDP(contour, eps, True).squeeze()
+                    if approx.ndim == 1:
+                        approx = approx.reshape(1, 2)
+                    if len(approx) < 3:
+                        continue
+                    pts = [(int(p[0] * scale),
+                            int((ih - p[1]) * scale + BASELINE))
+                           for p in approx]
+                    is_hole = hierarchy[i][3] != -1
+                    if is_hole:
+                        pts = pts[::-1]
+                    pen.moveTo(pts[0])
+                    for p in pts[1:]:
+                        pen.lineTo(p)
+                    pen.closePath()
+
+            glyphs[name]  = pen.glyph()
+            adv = int(iw * scale + 60)
+            metrics[name] = (adv, 20)
+
+        fb = FontBuilder(UPM, isTTF=True)
+        fb.setupGlyphOrder(glyph_order)
+        fb.setupCharacterMap(cmap_map)
+        fb.setupGlyf(glyphs)
+        fb.setupHorizontalMetrics(metrics)
+        fb.setupHorizontalHeader(ascent=ASCENDER, descent=DESCENDER)
+        fb.setupNameTable({
+            "familyName":           "HebrewHandwritten",
+            "styleName":            "Regular",
+            "fullName":             "HebrewHandwritten",
+            "psName":               "HebrewHandwritten-Regular",
+            "version":              "Version 1.0",
+            "uniqueFontIdentifier": "HebrewHandwritten",
+        })
+        fb.setupOS2(sTypoAscender=ASCENDER, sTypoDescender=DESCENDER,
+                    sCapHeight=CAP_HEIGHT, fsType=0)
+        fb.setupPost()
+        fb.setupHead(unitsPerEm=UPM)
+        fb.font.save(out_path)
 
     def _merge_layers_or(self):
         panel = self._sidebar._layers_panel
