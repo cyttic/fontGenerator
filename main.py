@@ -1025,6 +1025,7 @@ class ImageViewer(QLabel):
 class AssignmentPanel(QWidget):
     width_changed  = pyqtSignal(int)
     height_changed = pyqtSignal(int)
+    angle_changed  = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1064,6 +1065,13 @@ class AssignmentPanel(QWidget):
         layout.addWidget(self._h_slider)
         layout.addWidget(self._h_label)
 
+        # Angle slider
+        layout.addWidget(self._section("Angle"))
+        self._a_slider, self._a_label = self._make_slider(min_v=-45, max_v=45)
+        self._a_slider.valueChanged.connect(self._on_a)
+        layout.addWidget(self._a_slider)
+        layout.addWidget(self._a_label)
+
         hint = QLabel("Click a letter below\nto assign this crop")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setStyleSheet(
@@ -1078,9 +1086,9 @@ class AssignmentPanel(QWidget):
         lbl.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: bold;")
         return lbl
 
-    def _make_slider(self):
+    def _make_slider(self, min_v=4, max_v=800):
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(4, 800)
+        slider.setRange(min_v, max_v)
         slider.setStyleSheet(f"""
             QSlider::groove:horizontal {{
                 height: 4px; background: {C_BORDER}; border-radius: 2px;
@@ -1106,6 +1114,10 @@ class AssignmentPanel(QWidget):
         self._h_label.setText(f"{v} px")
         self.height_changed.emit(v)
 
+    def _on_a(self, v):
+        self._a_label.setText(f"{v}°")
+        self.angle_changed.emit(v)
+
     def set_rect(self, w, h):
         self._w_slider.blockSignals(True)
         self._h_slider.blockSignals(True)
@@ -1115,6 +1127,12 @@ class AssignmentPanel(QWidget):
         self._h_label.setText(f"{int(h)} px")
         self._w_slider.blockSignals(False)
         self._h_slider.blockSignals(False)
+
+    def set_angle(self, angle):
+        self._a_slider.blockSignals(True)
+        self._a_slider.setValue(int(angle))
+        self._a_label.setText(f"{int(angle)}°")
+        self._a_slider.blockSignals(False)
 
     def set_preview(self, img_crop):
         if img_crop is None or img_crop.size == 0:
@@ -1147,6 +1165,7 @@ class MainWindow(QMainWindow):
         # assignment / preview mode
         self._mode           = "normal"
         self._selected_rect  = None     # [x, y, w, h] mutable
+        self._selected_angle = 0        # degrees
         self._zoom_origin    = (0, 0)
         self._assigned       = {}       # letter_name → list of np.ndarray
         self._preview_letter = None
@@ -1193,6 +1212,7 @@ class MainWindow(QMainWindow):
         self._assign_panel = AssignmentPanel()
         self._assign_panel.width_changed.connect(self._on_assign_width)
         self._assign_panel.height_changed.connect(self._on_assign_height)
+        self._assign_panel.angle_changed.connect(self._on_assign_angle)
         self._assign_panel.hide()
 
         self._letter_preview = LetterPreviewWidget()
@@ -1317,7 +1337,9 @@ class MainWindow(QMainWindow):
     def _enter_assignment(self, rect_idx):
         self._mode = "assignment"
         self._selected_rect = list(self._char_rects[rect_idx])
+        self._selected_angle = 0
         self._assign_panel.set_rect(self._selected_rect[2], self._selected_rect[3])
+        self._assign_panel.set_angle(0)
         self._assign_panel.show()
         self._alphabet_bar._return_btn.setEnabled(True)
         self._viewer.setCursor(Qt.CursorShape.SizeAllCursor)
@@ -1360,17 +1382,24 @@ class MainWindow(QMainWindow):
         crop = filtered[y1:y2, x1:x2].copy()
         if len(crop.shape) == 2:
             crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+
+        # Rotated rect in crop coordinates
         rx, ry = x - x1, y - y1
-        # Dim everything outside the selection
-        overlay = crop.copy()
-        overlay[:, :] = (overlay * 0.4).astype(np.uint8)
-        overlay[ry:ry+h, rx:rx+w] = crop[ry:ry+h, rx:rx+w]
-        cv2.rectangle(overlay, (rx, ry), (rx+w, ry+h), (30, 120, 220), 2)
+        cx_c, cy_c = rx + w / 2, ry + h / 2
+        angle = self._selected_angle
+        box = cv2.boxPoints(((cx_c, cy_c), (w, h), angle)).astype(np.int32)
+
+        # Dim area outside the rotated selection
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [box], 255)
+        overlay = (crop * 0.4).astype(np.uint8)
+        overlay[mask > 0] = crop[mask > 0]
+        cv2.polylines(overlay, [box], True, (30, 120, 220), 2)
 
         self._viewer.set_pixmap(cv_to_pixmap(overlay))
 
-        # Preview in panel
-        char_crop = filtered[y:y+h, x:x+w] if h > 0 and w > 0 else None
+        # Preview in panel — extract rotated crop
+        char_crop = self._extract_rotated(filtered, x, y, w, h, angle)
         self._assign_panel.set_preview(char_crop)
         self._status.showMessage(
             f"Assignment mode  —  rect {w}×{h}px  —  drag to reposition  |  "
@@ -1399,16 +1428,34 @@ class MainWindow(QMainWindow):
             self._selected_rect[3] = val
             self._render_assignment()
 
+    def _on_assign_angle(self, val):
+        self._selected_angle = val
+        self._render_assignment()
+
+    def _extract_rotated(self, img, x, y, w, h, angle):
+        ih, iw = img.shape[:2]
+        cx, cy = x + w / 2, y + h / 2
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        fill = (255, 255, 255) if len(img.shape) == 3 else 255
+        rotated = cv2.warpAffine(img, M, (iw, ih),
+                                  flags=cv2.INTER_CUBIC,
+                                  borderMode=cv2.BORDER_CONSTANT,
+                                  borderValue=fill)
+        x1 = max(0, int(cx - w / 2))
+        y1 = max(0, int(cy - h / 2))
+        x2 = min(iw, int(cx + w / 2))
+        y2 = min(ih, int(cy + h / 2))
+        return rotated[y1:y2, x1:x2] if y2 > y1 and x2 > x1 else None
+
     def _on_letter_clicked(self, name):
         if self._mode == "assignment":
             # Assign current crop to letter
             img = self._load_cv(self._current_path)
             filtered = self._apply_filters(img)
             x, y, w, h = [int(v) for v in self._selected_rect]
-            ih, iw = filtered.shape[:2]
-            x  = max(0, min(iw - 1, x));  y  = max(0, min(ih - 1, y))
-            x2 = min(iw, x + w);           y2 = min(ih, y + h)
-            crop = filtered[y:y2, x:x2].copy()
+            crop = self._extract_rotated(filtered, x, y, w, h, self._selected_angle)
+            if crop is None:
+                return
             if name not in self._assigned:
                 self._assigned[name] = []
             self._assigned[name].append(crop)
