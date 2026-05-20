@@ -2,7 +2,8 @@ import sys
 import os
 import cv2
 import numpy as np
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, asdict
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QScrollArea,
     QFileDialog, QStatusBar, QSizePolicy,
@@ -16,6 +17,30 @@ from PyQt6.QtGui import (
     QImage, QPen, QBrush, QFont
 )
 from PyQt6.QtCore import Qt, QSize, QRect, pyqtSignal
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+
+def load_settings() -> "SegmentationSettings":
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            data = json.load(f)
+        s = SegmentationSettings()
+        for k, v in data.items():
+            if hasattr(s, k):
+                setattr(s, k, type(getattr(s, k))(v))
+        return s
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
+        return SegmentationSettings()
+
+
+def save_settings(s: "SegmentationSettings"):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(asdict(s), f, indent=2)
+    except Exception:
+        pass
+
 
 # ── Palette ────────────────────────────────────────────────────────────────
 C_BG          = "#f9f6f1"
@@ -119,8 +144,8 @@ class SegmentationSettings:
     min_area: int = 20
     min_width: int = 2
     min_height: int = 2
-    max_width: int = 500
-    max_height: int = 500
+    max_width: int = 25
+    max_height: int = 25
     connectivity: int = 8
 
 
@@ -1026,6 +1051,7 @@ class AssignmentPanel(QWidget):
     width_changed  = pyqtSignal(int)
     height_changed = pyqtSignal(int)
     angle_changed  = pyqtSignal(int)
+    move_requested = pyqtSignal(int, int)   # dx, dy in pixels
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1072,6 +1098,10 @@ class AssignmentPanel(QWidget):
         layout.addWidget(self._a_slider)
         layout.addWidget(self._a_label)
 
+        # D-pad
+        layout.addWidget(self._section("Position"))
+        layout.addWidget(self._make_dpad())
+
         hint = QLabel("Click a letter below\nto assign this crop")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setStyleSheet(
@@ -1080,6 +1110,50 @@ class AssignmentPanel(QWidget):
         )
         layout.addWidget(hint)
         layout.addStretch()
+
+    def _make_dpad(self):
+        container = QWidget()
+        container.setFixedSize(114, 114)
+        grid = QGridLayout(container)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(4)
+
+        directions = [
+            (0, 1, "▲",  0, -1),
+            (1, 0, "◄", -1,  0),
+            (1, 2, "►",  1,  0),
+            (2, 1, "▼",  0,  1),
+        ]
+        for row, col, arrow, dx, dy in directions:
+            btn = QPushButton(arrow)
+            btn.setFixedSize(34, 34)
+            btn.setAutoRepeat(True)
+            btn.setAutoRepeatDelay(400)
+            btn.setAutoRepeatInterval(80)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C_BG}; color: {C_TEXT};
+                    border: 1px solid {C_BORDER}; border-radius: 6px;
+                    font-size: 14px;
+                }}
+                QPushButton:hover {{
+                    background: {C_HOVER}; border-color: {C_SELECTED};
+                }}
+                QPushButton:pressed {{
+                    background: {C_SELECTED_BG}; border-color: {C_SELECTED};
+                }}
+            """)
+            btn.clicked.connect(lambda _, x=dx, y=dy: self.move_requested.emit(x, y))
+            grid.addWidget(btn, row, col)
+
+        # Center dot
+        center = QLabel("✛")
+        center.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        center.setFixedSize(34, 34)
+        center.setStyleSheet(f"color: {C_BORDER}; font-size: 14px;")
+        grid.addWidget(center, 1, 1)
+
+        return container
 
     def _section(self, text):
         lbl = QLabel(text)
@@ -1160,7 +1234,7 @@ class MainWindow(QMainWindow):
         self._line_rects   = []
         self._char_rects   = []
         self._show_chars   = False
-        self._seg_settings = SegmentationSettings()
+        self._seg_settings = load_settings()
         self._settings_dialog = None
         # assignment / preview mode
         self._mode           = "normal"
@@ -1213,6 +1287,7 @@ class MainWindow(QMainWindow):
         self._assign_panel.width_changed.connect(self._on_assign_width)
         self._assign_panel.height_changed.connect(self._on_assign_height)
         self._assign_panel.angle_changed.connect(self._on_assign_angle)
+        self._assign_panel.move_requested.connect(self._on_assign_move)
         self._assign_panel.hide()
 
         self._letter_preview = LetterPreviewWidget()
@@ -1432,6 +1507,16 @@ class MainWindow(QMainWindow):
         self._selected_angle = val
         self._render_assignment()
 
+    def _on_assign_move(self, dx, dy):
+        if not self._selected_rect or not self._current_path:
+            return
+        img = self._load_cv(self._current_path)
+        ih, iw = img.shape[:2]
+        x, y, w, h = self._selected_rect
+        self._selected_rect[0] = max(0, min(iw - w, x + dx))
+        self._selected_rect[1] = max(0, min(ih - h, y + dy))
+        self._render_assignment()
+
     def _extract_rotated(self, img, x, y, w, h, angle):
         ih, iw = img.shape[:2]
         cx, cy = x + w / 2, y + h / 2
@@ -1517,13 +1602,14 @@ class MainWindow(QMainWindow):
         )
 
     def _open_settings(self):
-        if self._settings_dialog is None:
+        if self._settings_dialog is None or not self._settings_dialog.isVisible():
             self._settings_dialog = SettingsDialog(
                 self._seg_settings, self._on_settings_changed, self)
         self._settings_dialog.show()
         self._settings_dialog.raise_()
 
     def _on_settings_changed(self):
+        save_settings(self._seg_settings)
         self._refresh_view()
 
 
