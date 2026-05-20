@@ -2,11 +2,14 @@ import sys
 import os
 import cv2
 import numpy as np
+from dataclasses import dataclass, field
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QScrollArea,
     QFileDialog, QStatusBar, QSizePolicy,
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QListWidget, QListWidgetItem, QSplitter, QButtonGroup
+    QListWidget, QListWidgetItem, QSplitter, QButtonGroup,
+    QDialog, QGroupBox, QFormLayout, QSlider, QComboBox,
+    QDialogButtonBox, QFrame, QSpinBox, QDoubleSpinBox
 )
 from PyQt6.QtGui import (
     QPixmap, QIcon, QAction, QKeySequence, QPainter, QColor,
@@ -105,23 +108,42 @@ def filter_deskew(img):
     return cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
 
 
+# ── Segmentation settings ─────────────────────────────────────────────────
+
+@dataclass
+class SegmentationSettings:
+    threshold_method: str = "otsu"   # "otsu", "adaptive", "manual"
+    manual_threshold: int = 128
+    line_kernel_width: int = 40
+    line_threshold_pct: int = 5      # percent 1-30
+    min_area: int = 20
+    min_width: int = 2
+    min_height: int = 2
+    max_width: int = 500
+    max_height: int = 500
+    connectivity: int = 8
+
+
 # ── Segmentation functions ────────────────────────────────────────────────
 
-def _to_binary(img):
+def _to_binary(img, s: SegmentationSettings):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    if s.threshold_method == "manual":
+        _, binary = cv2.threshold(gray, s.manual_threshold, 255, cv2.THRESH_BINARY_INV)
+    elif s.threshold_method == "adaptive":
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10)
+    else:
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     return binary
 
 
-def detect_lines(img):
-    binary = _to_binary(img)
-    # Dilate horizontally to merge nearby ink into solid line bands
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+def detect_lines(img, s: SegmentationSettings):
+    binary = _to_binary(img, s)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (s.line_kernel_width, 1))
     dilated = cv2.dilate(binary, kernel)
-
-    # Horizontal projection profile
     h_proj = np.sum(dilated, axis=1)
-    threshold = np.max(h_proj) * 0.05
+    threshold = np.max(h_proj) * (s.line_threshold_pct / 100)
 
     rects, start = [], None
     for i, val in enumerate(h_proj):
@@ -136,16 +158,17 @@ def detect_lines(img):
     return rects
 
 
-def detect_characters(img, line_rects):
-    binary = _to_binary(img)
-    min_area = max(20, int(img.shape[0] * img.shape[1] * 0.00005))
+def detect_characters(img, line_rects, s: SegmentationSettings):
+    binary = _to_binary(img, s)
     rects = []
     for (lx, ly, lw, lh) in line_rects:
         region = binary[ly:ly + lh, lx:lx + lw]
-        n, _, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=8)
+        n, _, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=s.connectivity)
         for i in range(1, n):
             x, y, w, h, area = stats[i]
-            if area >= min_area and w > 2 and h > 2:
+            if (area >= s.min_area and
+                    s.min_width <= w <= s.max_width and
+                    s.min_height <= h <= s.max_height):
                 rects.append((lx + x, ly + y, w, h))
     return rects
 
@@ -237,6 +260,176 @@ def icon_characters(p, s):
     p.setBrush(Qt.BrushStyle.NoBrush)
     for x, y, w, h in [(2, 4, 7, 18), (11, 4, 5, 18), (18, 4, 6, 18)]:
         p.drawRect(QRect(x, y, w, h))
+
+
+# ── Settings dialog ────────────────────────────────────────────────────────
+
+class SettingsDialog(QDialog):
+    def __init__(self, settings: SegmentationSettings, on_changed, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.on_changed = on_changed
+        self.setWindowTitle("Detection Settings")
+        self.setFixedWidth(420)
+        self.setStyleSheet(f"background: {C_BG}; color: {C_TEXT};")
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        layout.addWidget(self._group_binarization())
+        layout.addWidget(self._group_lines())
+        layout.addWidget(self._group_chars())
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_BTN_ADD}; color: white; border: none;
+                border-radius: 4px; padding: 6px 20px;
+            }}
+            QPushButton:hover {{ background: {C_BTN_ADD_H}; }}
+        """)
+        btn_box.rejected.connect(self.close)
+        layout.addWidget(btn_box)
+
+    def _group_binarization(self):
+        group = self._make_group("Binarization")
+        form = QFormLayout(group)
+
+        method_box = QComboBox()
+        method_box.addItems(["Otsu (auto)", "Adaptive", "Manual"])
+        method_box.setCurrentIndex(["otsu", "adaptive", "manual"]
+                                    .index(self.settings.threshold_method))
+        method_box.setStyleSheet(self._combo_style())
+
+        manual_spin = QSpinBox()
+        manual_spin.setRange(0, 255)
+        manual_spin.setValue(self.settings.manual_threshold)
+        manual_spin.setEnabled(self.settings.threshold_method == "manual")
+        manual_spin.setStyleSheet(self._spin_style())
+        manual_spin.setToolTip("Active only when method is Manual")
+
+        def on_method(idx):
+            self.settings.threshold_method = ["otsu", "adaptive", "manual"][idx]
+            manual_spin.setEnabled(idx == 2)
+            self.on_changed()
+
+        method_box.currentIndexChanged.connect(on_method)
+        manual_spin.valueChanged.connect(
+            lambda v: self._set_and_notify("manual_threshold", v))
+
+        form.addRow("Method:", method_box)
+        form.addRow("Manual threshold:", manual_spin)
+        return group
+
+    def _group_lines(self):
+        group = self._make_group("Line Detection")
+        form = QFormLayout(group)
+
+        form.addRow("Merge kernel width:",
+                    self._slider(10, 120, self.settings.line_kernel_width, 1,
+                                 "line_kernel_width", suffix="px"))
+        form.addRow("Line sensitivity:",
+                    self._slider(1, 30, self.settings.line_threshold_pct, 1,
+                                 "line_threshold_pct", suffix="%"))
+        return group
+
+    def _group_chars(self):
+        group = self._make_group("Character Detection")
+        form = QFormLayout(group)
+
+        connectivity_box = QComboBox()
+        connectivity_box.addItems(["4 — horizontal/vertical only",
+                                   "8 — include diagonals"])
+        connectivity_box.setCurrentIndex(0 if self.settings.connectivity == 4 else 1)
+        connectivity_box.setStyleSheet(self._combo_style())
+        connectivity_box.currentIndexChanged.connect(
+            lambda i: self._set_and_notify("connectivity", 4 if i == 0 else 8))
+
+        form.addRow("Min area (px²):",
+                    self._slider(5, 500, self.settings.min_area, 5,
+                                 "min_area", suffix="px²"))
+        form.addRow("Min width:",
+                    self._slider(1, 100, self.settings.min_width, 1,
+                                 "min_width", suffix="px"))
+        form.addRow("Max width:",
+                    self._slider(10, 1000, self.settings.max_width, 10,
+                                 "max_width", suffix="px"))
+        form.addRow("Min height:",
+                    self._slider(1, 100, self.settings.min_height, 1,
+                                 "min_height", suffix="px"))
+        form.addRow("Max height:",
+                    self._slider(10, 1000, self.settings.max_height, 10,
+                                 "max_height", suffix="px"))
+        form.addRow("Connectivity:", connectivity_box)
+        return group
+
+    def _slider(self, min_val, max_val, current, step, attr, suffix=""):
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(current)
+        slider.setSingleStep(step)
+        slider.setStyleSheet(self._slider_style())
+
+        val_label = QLabel(f"{current}{suffix}")
+        val_label.setFixedWidth(52)
+        val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        val_label.setStyleSheet(f"color: {C_SELECTED}; font-weight: bold; font-size: 12px;")
+
+        def on_change(v):
+            val_label.setText(f"{v}{suffix}")
+            self._set_and_notify(attr, v)
+
+        slider.valueChanged.connect(on_change)
+        row.addWidget(slider)
+        row.addWidget(val_label)
+        return container
+
+    def _set_and_notify(self, attr, value):
+        setattr(self.settings, attr, value)
+        self.on_changed()
+
+    def _make_group(self, title):
+        group = QGroupBox(title)
+        group.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: bold; font-size: 12px;
+                color: {C_TEXT}; border: 1px solid {C_BORDER};
+                border-radius: 6px; margin-top: 8px; padding-top: 8px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin; left: 10px; padding: 0 4px;
+                color: {C_TEXT_MUTED};
+            }}
+        """)
+        return group
+
+    def _combo_style(self):
+        return (f"QComboBox {{ background: {C_BG}; border: 1px solid {C_BORDER}; "
+                f"border-radius: 4px; padding: 3px 6px; color: {C_TEXT}; }}")
+
+    def _spin_style(self):
+        return (f"QSpinBox {{ background: {C_BG}; border: 1px solid {C_BORDER}; "
+                f"border-radius: 4px; padding: 3px 6px; color: {C_TEXT}; }}")
+
+    def _slider_style(self):
+        return f"""
+            QSlider::groove:horizontal {{
+                height: 4px; background: {C_BORDER}; border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {C_SELECTED}; width: 14px; height: 14px;
+                margin: -5px 0; border-radius: 7px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {C_SELECTED}; border-radius: 2px;
+            }}
+        """
 
 
 # ── Filter bar ─────────────────────────────────────────────────────────────
@@ -512,11 +705,13 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(f"background: {C_BG};")
 
         self._current_path = None
-        self._cv_cache = {}            # path → original cv2 image
+        self._cv_cache = {}
         self._active_filter = filter_original
         self._line_rects = []
         self._char_rects = []
         self._show_chars = False
+        self._seg_settings = SegmentationSettings()
+        self._settings_dialog = None
 
         self._build_menu()
         self._build_central()
@@ -537,6 +732,12 @@ class MainWindow(QMainWindow):
         quit_act.setShortcut(QKeySequence.StandardKey.Quit)
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
+
+        detect_menu = menu.addMenu("&Detection")
+        settings_act = QAction("&Settings...", self)
+        settings_act.setShortcut("Ctrl+,")
+        settings_act.triggered.connect(self._open_settings)
+        detect_menu.addAction(settings_act)
 
     def _build_central(self):
         self._viewer = ImageViewer()
@@ -613,8 +814,8 @@ class MainWindow(QMainWindow):
             self.setWindowTitle("Font Generator")
             return
         if self._show_chars:
-            self._line_rects = detect_lines(self._load_cv(path))
-            self._char_rects = detect_characters(self._load_cv(path), self._line_rects)
+            self._line_rects = detect_lines(self._load_cv(path), self._seg_settings)
+            self._char_rects = detect_characters(self._load_cv(path), self._line_rects, self._seg_settings)
         self._refresh_view()
         self.setWindowTitle(f"Font Generator — {os.path.basename(path)}")
 
@@ -625,12 +826,26 @@ class MainWindow(QMainWindow):
     def _on_chars_toggled(self, checked):
         self._show_chars = checked
         if self._current_path and checked:
-            self._line_rects = detect_lines(self._load_cv(self._current_path))
+            self._line_rects = detect_lines(self._load_cv(self._current_path), self._seg_settings)
             self._char_rects = detect_characters(
-                self._load_cv(self._current_path), self._line_rects)
+                self._load_cv(self._current_path), self._line_rects, self._seg_settings)
         elif not checked:
             self._line_rects = []
             self._char_rects = []
+        self._refresh_view()
+
+    def _open_settings(self):
+        if self._settings_dialog is None:
+            self._settings_dialog = SettingsDialog(
+                self._seg_settings, self._on_settings_changed, self)
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+
+    def _on_settings_changed(self):
+        if self._show_chars and self._current_path:
+            img = self._load_cv(self._current_path)
+            self._line_rects = detect_lines(img, self._seg_settings)
+            self._char_rects = detect_characters(img, self._line_rects, self._seg_settings)
         self._refresh_view()
 
 
