@@ -15,7 +15,7 @@ from PyQt6.QtGui import (
     QPixmap, QIcon, QAction, QKeySequence, QPainter, QColor,
     QImage, QPen, QBrush, QFont
 )
-from PyQt6.QtCore import Qt, QSize, QRect
+from PyQt6.QtCore import Qt, QSize, QRect, pyqtSignal
 
 # ── Palette ────────────────────────────────────────────────────────────────
 C_BG          = "#f9f6f1"
@@ -456,27 +456,24 @@ class FilterBar(QWidget):
         layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(6)
 
-        # ── Filter buttons (exclusive) ──
+        # ── Filter buttons (independent toggles) ──
         label = QLabel("Filters:")
         label.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 11px; font-weight: bold;")
         layout.addWidget(label)
 
-        self._group = QButtonGroup(self)
-        self._group.setExclusive(True)
-
+        self._btns = []
         for i, (name, icon_fn, fn, tip) in enumerate(FILTERS):
             btn = QPushButton()
             btn.setCheckable(True)
-            btn.setChecked(i == 0)
+            btn.setChecked(i == 0)   # Original on by default
             btn.setFixedSize(38, 38)
             btn.setIcon(QIcon(_make_icon(icon_fn)))
             btn.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
             btn.setToolTip(f"<b>{name}</b><br>{tip}")
             btn.setStyleSheet(self._btn_style())
-            self._group.addButton(btn, i)
+            btn.toggled.connect(lambda checked, idx=i: self._on_toggled(idx, checked))
+            self._btns.append(btn)
             layout.addWidget(btn)
-
-        self._group.idToggled.connect(self._on_toggled)
 
         # ── Separator ──
         sep = QWidget()
@@ -526,12 +523,173 @@ class FilterBar(QWidget):
         """
 
     def _on_toggled(self, btn_id, checked):
-        if checked:
-            self.on_filter_changed(FILTERS[btn_id][2])
+        # "Original" (idx 0) unchecks all others; checking any other unchecks Original
+        if btn_id == 0 and checked:
+            for i, btn in enumerate(self._btns):
+                if i != 0:
+                    btn.blockSignals(True)
+                    btn.setChecked(False)
+                    btn.blockSignals(False)
+        elif btn_id != 0 and checked:
+            self._btns[0].blockSignals(True)
+            self._btns[0].setChecked(False)
+            self._btns[0].blockSignals(False)
+        self.on_filter_changed()
 
-    def current_filter(self):
-        idx = self._group.checkedId()
-        return FILTERS[idx][2] if idx >= 0 else filter_original
+    def active_filters(self):
+        """Return list of active filter functions in order, skipping Original."""
+        return [FILTERS[i][2] for i, btn in enumerate(self._btns)
+                if i != 0 and btn.isChecked()]
+
+
+# ── Hebrew alphabet ────────────────────────────────────────────────────────
+
+HEBREW_ALPHABET = [
+    ('alef',        'א', 'Alef'),
+    ('bet',         'ב', 'Bet'),
+    ('gimel',       'ג', 'Gimel'),
+    ('dalet',       'ד', 'Dalet'),
+    ('he',          'ה', 'He'),
+    ('vav',         'ו', 'Vav'),
+    ('zayin',       'ז', 'Zayin'),
+    ('het',         'ח', 'Het'),
+    ('tet',         'ט', 'Tet'),
+    ('yod',         'י', 'Yod'),
+    ('kaf',         'כ', 'Kaf'),
+    ('kaf_final',   'ך', 'Kaf (final)'),
+    ('lamed',       'ל', 'Lamed'),
+    ('mem',         'מ', 'Mem'),
+    ('mem_final',   'ם', 'Mem (final)'),
+    ('nun',         'נ', 'Nun'),
+    ('nun_final',   'ן', 'Nun (final)'),
+    ('samekh',      'ס', 'Samekh'),
+    ('ayin',        'ע', 'Ayin'),
+    ('pe',          'פ', 'Pe'),
+    ('pe_final',    'ף', 'Pe (final)'),
+    ('tsadi',       'צ', 'Tsadi'),
+    ('tsadi_final', 'ץ', 'Tsadi (final)'),
+    ('qof',         'ק', 'Qof'),
+    ('resh',        'ר', 'Resh'),
+    ('shin',        'ש', 'Shin'),
+    ('tav',         'ת', 'Tav'),
+]
+
+
+class LetterTile(QFrame):
+    clicked = pyqtSignal(str)
+
+    def __init__(self, name, letter, label, parent=None):
+        super().__init__(parent)
+        self.name = name
+        self._has_images = False
+        self.setFixedSize(70, 76)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(f"{label}  ({letter})")
+        self._apply_style(False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 6, 4, 4)
+        layout.setSpacing(2)
+
+        self._letter_lbl = QLabel(letter)
+        self._letter_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._letter_lbl.setStyleSheet(
+            "font-size: 26px; font-weight: bold; background: transparent;"
+        )
+        layout.addWidget(self._letter_lbl)
+
+        self._dot = QLabel("●")
+        self._dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dot.setFixedHeight(10)
+        self._dot.setStyleSheet("font-size: 7px; color: #ccc; background: transparent;")
+        layout.addWidget(self._dot)
+
+    def set_has_images(self, value: bool):
+        self._has_images = value
+        self._dot.setStyleSheet(
+            f"font-size: 7px; color: {'#4caf50' if value else '#ccc'}; background: transparent;"
+        )
+
+    def _apply_style(self, hovered):
+        bg = C_HOVER if hovered else C_BG
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {bg};
+                border: 1px solid {C_BORDER};
+                border-radius: 6px;
+            }}
+        """)
+
+    def enterEvent(self, e):
+        self._apply_style(True)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._apply_style(False)
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.name)
+        super().mousePressEvent(e)
+
+
+class HebrewAlphabetBar(QWidget):
+    def __init__(self, on_letter_clicked, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(104)
+        self.setStyleSheet(
+            f"background: {C_SIDEBAR_HDR}; border-top: 1px solid {C_BORDER};"
+        )
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Scrollable tiles
+        scroll = QScrollArea()
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(f"border: none; background: {C_SIDEBAR_HDR};")
+
+        tiles_widget = QWidget()
+        tiles_widget.setStyleSheet(f"background: {C_SIDEBAR_HDR};")
+        tiles_layout = QHBoxLayout(tiles_widget)
+        tiles_layout.setContentsMargins(10, 8, 10, 8)
+        tiles_layout.setSpacing(6)
+
+        self._tiles = {}
+        for name, letter, label in HEBREW_ALPHABET:
+            tile = LetterTile(name, letter, label)
+            tile.clicked.connect(on_letter_clicked)
+            self._tiles[name] = tile
+            tiles_layout.addWidget(tile)
+
+        tiles_layout.addStretch()
+        scroll.setWidget(tiles_widget)
+        outer.addWidget(scroll)
+
+        # Return button (disabled until letter-preview mode is implemented)
+        sep = QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet(f"background: {C_BORDER};")
+        outer.addWidget(sep)
+
+        self._return_btn = QPushButton("← Back")
+        self._return_btn.setFixedSize(72, 104)
+        self._return_btn.setEnabled(False)
+        self._return_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_SIDEBAR_HDR}; color: {C_TEXT_MUTED};
+                border: none; font-size: 12px;
+            }}
+            QPushButton:enabled:hover {{ background: {C_HOVER}; color: {C_TEXT}; }}
+        """)
+        outer.addWidget(self._return_btn)
+
+    def tile(self, name) -> LetterTile:
+        return self._tiles.get(name)
 
 
 # ── Image list sidebar ─────────────────────────────────────────────────────
@@ -706,7 +864,6 @@ class MainWindow(QMainWindow):
 
         self._current_path = None
         self._cv_cache = {}
-        self._active_filter = filter_original
         self._line_rects = []
         self._char_rects = []
         self._show_chars = False
@@ -753,6 +910,7 @@ class MainWindow(QMainWindow):
             on_chars_toggled=self._on_chars_toggled,
         )
         self._sidebar = Sidebar(on_select=self._on_image_selected)
+        self._alphabet_bar = HebrewAlphabetBar(on_letter_clicked=self._on_letter_clicked)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -760,6 +918,7 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(0)
         right_layout.addWidget(self._filter_bar)
         right_layout.addWidget(scroll)
+        right_layout.addWidget(self._alphabet_bar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._sidebar)
@@ -787,19 +946,30 @@ class MainWindow(QMainWindow):
                 self._cv_cache[path] = img
         return self._cv_cache.get(path)
 
+    def _apply_filters(self, img):
+        fns = self._filter_bar.active_filters()
+        result = img.copy()
+        for fn in fns:
+            result = fn(result)
+        return result
+
     def _refresh_view(self):
         if not self._current_path:
             return
         img = self._load_cv(self._current_path)
         if img is None:
             return
-        result = self._active_filter(img)
-        result = draw_overlays(result, self._char_rects, self._show_chars)
+        filtered = self._apply_filters(img)
+        if self._show_chars:
+            self._line_rects = detect_lines(filtered, self._seg_settings)
+            self._char_rects = detect_characters(filtered, self._line_rects, self._seg_settings)
+        result = draw_overlays(filtered, self._char_rects, self._show_chars)
         self._viewer.set_pixmap(cv_to_pixmap(result))
         h, w = img.shape[:2]
-        filter_name = next(f[0] for f in FILTERS if f[2] == self._active_filter)
+        active = self._filter_bar.active_filters()
+        filter_names = [f[0] for f in FILTERS if f[2] in active] or ["Original"]
         parts = [os.path.basename(self._current_path), f"{w}×{h}px",
-                 f"Filter: {filter_name}"]
+                 "Filters: " + " + ".join(filter_names)]
         if self._show_chars:
             parts.append(f"Chars: {len(self._char_rects)}")
         self._status.showMessage("  —  ".join(parts))
@@ -813,26 +983,24 @@ class MainWindow(QMainWindow):
             self._status.showMessage("Ready")
             self.setWindowTitle("Font Generator")
             return
-        if self._show_chars:
-            self._line_rects = detect_lines(self._load_cv(path), self._seg_settings)
-            self._char_rects = detect_characters(self._load_cv(path), self._line_rects, self._seg_settings)
         self._refresh_view()
         self.setWindowTitle(f"Font Generator — {os.path.basename(path)}")
 
-    def _on_filter_changed(self, filter_fn):
-        self._active_filter = filter_fn
+    def _on_filter_changed(self):
         self._refresh_view()
 
     def _on_chars_toggled(self, checked):
         self._show_chars = checked
-        if self._current_path and checked:
-            self._line_rects = detect_lines(self._load_cv(self._current_path), self._seg_settings)
-            self._char_rects = detect_characters(
-                self._load_cv(self._current_path), self._line_rects, self._seg_settings)
-        elif not checked:
+        if not checked:
             self._line_rects = []
             self._char_rects = []
         self._refresh_view()
+
+    def _on_letter_clicked(self, name):
+        # Preview mode will be implemented later
+        entry = next((e for e in HEBREW_ALPHABET if e[0] == name), None)
+        if entry:
+            self._status.showMessage(f"Letter: {entry[2]}  ({entry[1]})  — selection mechanism coming soon")
 
     def _open_settings(self):
         if self._settings_dialog is None:
@@ -842,10 +1010,6 @@ class MainWindow(QMainWindow):
         self._settings_dialog.raise_()
 
     def _on_settings_changed(self):
-        if self._show_chars and self._current_path:
-            img = self._load_cv(self._current_path)
-            self._line_rects = detect_lines(img, self._seg_settings)
-            self._char_rects = detect_characters(img, self._line_rects, self._seg_settings)
         self._refresh_view()
 
 
