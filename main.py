@@ -3,6 +3,7 @@ import os
 import cv2
 import numpy as np
 import json
+from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QScrollArea,
@@ -62,6 +63,7 @@ C_FILTER_ACT_BG = "#fdf0e6"
 
 THUMB_SIZE    = 64
 SIDEBAR_WIDTH = 220
+LAYERS_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layers")
 ICON_SIZE     = 26
 
 
@@ -131,6 +133,22 @@ def filter_deskew(img):
     result = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC,
                             borderMode=cv2.BORDER_REPLICATE)
     return cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+
+
+_active_char_rects = []   # set by MainWindow before calling filters
+
+
+def filter_isolate_chars(img):
+    if not _active_char_rects:
+        return img
+    if len(img.shape) == 2:
+        result = np.full_like(img, 255)
+    else:
+        result = np.full_like(img, 255)
+    for (x, y, w, h) in _active_char_rects:
+        y2, x2 = min(y + h, img.shape[0]), min(x + w, img.shape[1])
+        result[y:y2, x:x2] = img[y:y2, x:x2]
+    return result
 
 
 # ── Segmentation settings ─────────────────────────────────────────────────
@@ -277,6 +295,16 @@ def icon_deskew(p, s):
     p.drawLine(3, s - 6, s - 3, 5)
     p.setPen(QPen(QColor("#333"), 2))
     p.drawLine(3, s // 2, s - 3, s // 2)
+
+
+def icon_isolate(p, s):
+    # White background with small dark letter-like squares
+    p.fillRect(QRect(2, 2, s - 4, s - 4), QColor("#fff"))
+    p.setPen(QPen(QColor(C_BORDER), 1))
+    p.drawRect(QRect(2, 2, s - 4, s - 4))
+    p.setPen(Qt.PenStyle.NoPen)
+    for rx, ry, rw, rh in [(5, 6, 5, 10), (13, 8, 4, 8), (19, 5, 4, 12)]:
+        p.fillRect(QRect(rx, ry, rw, rh), QColor("#333"))
 
 
 def icon_characters(p, s):
@@ -466,7 +494,8 @@ FILTERS = [
     ("Adaptive",   icon_adaptive,  filter_adaptive,  "Adaptive threshold binarization"),
     ("CLAHE",      icon_clahe,     filter_clahe,     "Contrast enhancement (CLAHE)"),
     ("Denoise",    icon_denoise,   filter_denoise,   "Noise removal (median + morphology)"),
-    ("Deskew",     icon_deskew,    filter_deskew,    "Auto deskew correction"),
+    ("Deskew",    icon_deskew,   filter_deskew,        "Auto deskew correction"),
+    ("Isolate",   icon_isolate,  filter_isolate_chars, "Show only detected characters on white background"),
 ]
 
 
@@ -866,78 +895,71 @@ class ImageListItem(QWidget):
         layout.addWidget(name)
 
 
-class Sidebar(QWidget):
-    def __init__(self, on_select, parent=None):
+def _list_style():
+    return f"""
+        QListWidget {{ background: {C_SIDEBAR}; border: none; }}
+        QListWidget::item {{ border-bottom: 1px solid {C_BORDER}; color: {C_TEXT}; }}
+        QListWidget::item:selected {{
+            background: {C_SELECTED_BG}; border-left: 3px solid {C_SELECTED};
+        }}
+        QListWidget::item:hover:!selected {{ background: {C_HOVER}; }}
+    """
+
+
+def _btn_style(bg, hover):
+    return (f"QPushButton {{ background: {bg}; color: #fff; border: none; "
+            f"border-radius: 4px; padding: 4px 8px; font-size: 12px; }}"
+            f"QPushButton:hover {{ background: {hover}; }}")
+
+
+class _ListPanel(QWidget):
+    """Reusable panel: header + list + button bar."""
+    def __init__(self, title, on_select, buttons, parent=None):
         super().__init__(parent)
         self.on_select = on_select
-        self.setFixedWidth(SIDEBAR_WIDTH)
         self.setStyleSheet(f"background: {C_SIDEBAR};")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        header = QLabel("  Images")
-        header.setFixedHeight(36)
+        header = QLabel(f"  {title}")
+        header.setFixedHeight(32)
         header.setStyleSheet(
             f"background: {C_SIDEBAR_HDR}; color: {C_TEXT_MUTED}; "
-            f"font-size: 12px; font-weight: bold; border-bottom: 1px solid {C_BORDER};"
+            f"font-size: 11px; font-weight: bold; border-bottom: 1px solid {C_BORDER};"
         )
         layout.addWidget(header)
 
         self.list_widget = QListWidget()
-        self.list_widget.setStyleSheet(f"""
-            QListWidget {{ background: {C_SIDEBAR}; border: none; }}
-            QListWidget::item {{ border-bottom: 1px solid {C_BORDER}; color: {C_TEXT}; }}
-            QListWidget::item:selected {{
-                background: {C_SELECTED_BG}; border-left: 3px solid {C_SELECTED};
-            }}
-            QListWidget::item:hover:!selected {{ background: {C_HOVER}; }}
-        """)
+        self.list_widget.setStyleSheet(_list_style())
         self.list_widget.setSpacing(2)
-        self.list_widget.currentItemChanged.connect(self._on_item_changed)
+        self.list_widget.currentItemChanged.connect(self._on_changed)
         layout.addWidget(self.list_widget)
 
-        btn_bar = QWidget()
-        btn_bar.setFixedHeight(44)
-        btn_bar.setStyleSheet(f"background: {C_SIDEBAR_HDR}; border-top: 1px solid {C_BORDER};")
-        btn_layout = QHBoxLayout(btn_bar)
-        btn_layout.setContentsMargins(8, 6, 8, 6)
-        btn_layout.setSpacing(8)
+        if buttons:
+            bar = QWidget()
+            bar.setFixedHeight(40)
+            bar.setStyleSheet(f"background: {C_SIDEBAR_HDR}; border-top: 1px solid {C_BORDER};")
+            bl = QHBoxLayout(bar)
+            bl.setContentsMargins(6, 5, 6, 5)
+            bl.setSpacing(6)
+            for label, bg, bg_h, slot in buttons:
+                btn = QPushButton(label)
+                btn.setStyleSheet(_btn_style(bg, bg_h))
+                btn.clicked.connect(slot)
+                bl.addWidget(btn)
+            layout.addWidget(bar)
 
-        btn_add = QPushButton("+ Add")
-        btn_add.setStyleSheet(self._btn_style(C_BTN_ADD, C_BTN_ADD_H))
-        btn_add.clicked.connect(self.add_images)
-
-        btn_remove = QPushButton("− Remove")
-        btn_remove.setStyleSheet(self._btn_style(C_BTN_REM, C_BTN_REM_H))
-        btn_remove.clicked.connect(self.remove_selected)
-
-        btn_layout.addWidget(btn_add)
-        btn_layout.addWidget(btn_remove)
-        layout.addWidget(btn_bar)
-
-    def _btn_style(self, bg, hover):
-        return (f"QPushButton {{ background: {bg}; color: #fff; border: none; "
-                f"border-radius: 4px; padding: 4px 8px; font-size: 12px; }}"
-                f"QPushButton:hover {{ background: {hover}; }}")
-
-    def add_images(self):
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open Image Files", "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*)"
-        )
-        for path in paths:
-            self._add_item(path)
-
-    def _add_item(self, path):
+    def add_item(self, path, pixmap=None):
+        if pixmap is None:
+            pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return
         for i in range(self.list_widget.count()):
             w = self.list_widget.itemWidget(self.list_widget.item(i))
             if w and w.path == path:
                 return
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            return
         item = QListWidgetItem(self.list_widget)
         widget = ImageListItem(path, pixmap)
         item.setSizeHint(widget.sizeHint())
@@ -957,9 +979,69 @@ class Sidebar(QWidget):
             else:
                 self.on_select(None)
 
-    def _on_item_changed(self, current, previous):
+    def _on_changed(self, current, previous):
         path = current.data(Qt.ItemDataRole.UserRole) if current else None
         self.on_select(path)
+
+
+class Sidebar(QWidget):
+    def __init__(self, on_select, parent=None):
+        super().__init__(parent)
+        self.on_select = on_select
+        self.setFixedWidth(SIDEBAR_WIDTH)
+        self.setStyleSheet(f"background: {C_SIDEBAR};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setHandleWidth(4)
+        splitter.setStyleSheet(
+            f"QSplitter::handle {{ background: {C_BORDER}; }}"
+        )
+
+        self._images_panel = _ListPanel(
+            "Images", on_select,
+            buttons=[
+                ("+ Add",    C_BTN_ADD, C_BTN_ADD_H, self._add_images),
+                ("− Remove", C_BTN_REM, C_BTN_REM_H, self._remove_image),
+            ]
+        )
+
+        self._layers_panel = _ListPanel(
+            "Layers", on_select,
+            buttons=[
+                ("− Remove", C_BTN_REM, C_BTN_REM_H, self._remove_layer),
+            ]
+        )
+
+        splitter.addWidget(self._images_panel)
+        splitter.addWidget(self._layers_panel)
+        splitter.setSizes([400, 200])
+
+        layout.addWidget(splitter)
+
+    def _add_images(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open Image Files", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*)"
+        )
+        for path in paths:
+            self._images_panel.add_item(path)
+
+    def _remove_image(self):
+        self._images_panel.remove_selected()
+
+    def _remove_layer(self):
+        self._layers_panel.remove_selected()
+
+    # Public helpers used by MainWindow
+    def add_images(self):
+        self._add_images()
+
+    def add_layer(self, path):
+        self._layers_panel.add_item(path)
 
 
 # ── Image viewer ───────────────────────────────────────────────────────────
@@ -1354,6 +1436,12 @@ class MainWindow(QMainWindow):
         open_act.setShortcut(QKeySequence.StandardKey.Open)
         open_act.triggered.connect(lambda: self._sidebar.add_images())
         file_menu.addAction(open_act)
+
+        save_act = QAction("&Save Layer", self)
+        save_act.setShortcut("Ctrl+S")
+        save_act.triggered.connect(self._save_layer)
+        file_menu.addAction(save_act)
+
         file_menu.addSeparator()
 
         quit_act = QAction("&Quit", self)
@@ -1451,6 +1539,8 @@ class MainWindow(QMainWindow):
         return self._cv_cache.get(path)
 
     def _apply_filters(self, img):
+        global _active_char_rects
+        _active_char_rects = self._char_rects
         fns = self._filter_bar.active_filters()
         result = img.copy()
         for fn in fns:
@@ -1706,6 +1796,25 @@ class MainWindow(QMainWindow):
         self._status.showMessage(
             f"Removed sample — {len(self._assigned[name])} remaining"
         )
+
+    def _save_layer(self):
+        if not self._current_path:
+            self._status.showMessage("No image loaded to save.")
+            return
+        img = self._load_cv(self._current_path)
+        if img is None:
+            return
+        filtered = self._apply_filters(img)
+        result = draw_overlays(filtered, self._char_rects, self._show_chars)
+
+        os.makedirs(LAYERS_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"layer_{timestamp}.png"
+        path = os.path.join(LAYERS_DIR, filename)
+        cv2.imwrite(path, result)
+
+        self._sidebar.add_layer(path)
+        self._status.showMessage(f"Layer saved: {filename}")
 
     def _open_settings(self):
         if self._settings_dialog is None or not self._settings_dialog.isVisible():
