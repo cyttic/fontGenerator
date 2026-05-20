@@ -1,8 +1,8 @@
 {
   "threshold_method": "manual",
-  "manual_threshold": 147,
-  "line_kernel_width": 65,
-  "line_threshold_pct": 2,
+  "manual_threshold": 121,
+  "line_kernel_width": 120,
+  "line_threshold_pct": 8,
   "min_area": 5,
   "max_area": 1351,
   "min_width": 1,

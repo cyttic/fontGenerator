@@ -1037,7 +1037,7 @@ class _ListPanel(QWidget):
 
 
 class Sidebar(QWidget):
-    def __init__(self, on_select, parent=None):
+    def __init__(self, on_select, on_merge_layers=None, parent=None):
         super().__init__(parent)
         self.on_select = on_select
         self.setFixedWidth(SIDEBAR_WIDTH)
@@ -1061,11 +1061,11 @@ class Sidebar(QWidget):
             ]
         )
 
+        merge_btn = [("⊕ OR", C_BTN_ADD, C_BTN_ADD_H, on_merge_layers)] \
+                    if on_merge_layers else []
         self._layers_panel = _ListPanel(
             "Layers", self._on_layers_select,
-            buttons=[
-                ("− Remove", C_BTN_REM, C_BTN_REM_H, self._remove_layer),
-            ]
+            buttons=[("− Remove", C_BTN_REM, C_BTN_REM_H, self._remove_layer)] + merge_btn
         )
 
         splitter.addWidget(self._images_panel)
@@ -1118,6 +1118,7 @@ class ImageViewer(QLabel):
     right_clicked = pyqtSignal()
     drag_started  = pyqtSignal(float, float)
     drag_moved    = pyqtSignal(float, float)
+    pixel_moved   = pyqtSignal(float, float)   # absolute image coords on mouse-hold move
 
     ZOOM_MIN = 0.05
     ZOOM_MAX = 10.0
@@ -1276,6 +1277,8 @@ class ImageViewer(QLabel):
 
     def mouseMoveEvent(self, e):
         if self._drag_last and e.buttons() & Qt.MouseButton.LeftButton:
+            ix, iy = self.widget_to_image(e.position().x(), e.position().y())
+            self.pixel_moved.emit(ix, iy)
             dx_w = e.position().x() - self._drag_last[0]
             dy_w = e.position().y() - self._drag_last[1]
             if not self._pixmap or self._pixmap.isNull():
@@ -1297,7 +1300,8 @@ class AssignmentPanel(QWidget):
     width_changed  = pyqtSignal(int)
     height_changed = pyqtSignal(int)
     angle_changed  = pyqtSignal(int)
-    move_requested = pyqtSignal(int, int)   # dx, dy in pixels
+    move_requested = pyqtSignal(int, int)
+    eraser_toggled = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1348,6 +1352,25 @@ class AssignmentPanel(QWidget):
         layout.addWidget(self._section("Position"))
         layout.addWidget(self._make_dpad())
 
+        # Eraser tool
+        layout.addWidget(self._section("Tools"))
+        self._eraser_btn = QPushButton("⬜  Eraser  (2×2 px)")
+        self._eraser_btn.setCheckable(True)
+        self._eraser_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C_BG}; color: {C_TEXT};
+                border: 1px solid {C_BORDER}; border-radius: 6px;
+                padding: 6px; font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {C_HOVER}; border-color: {C_SELECTED}; }}
+            QPushButton:checked {{
+                background: {C_FILTER_ACT_BG}; border: 2px solid {C_FILTER_ACT};
+                color: {C_TEXT};
+            }}
+        """)
+        self._eraser_btn.toggled.connect(self.eraser_toggled.emit)
+        layout.addWidget(self._eraser_btn)
+
         hint = QLabel("Click a letter below\nto assign this crop")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setStyleSheet(
@@ -1356,6 +1379,11 @@ class AssignmentPanel(QWidget):
         )
         layout.addWidget(hint)
         layout.addStretch()
+
+    def reset_eraser(self):
+        self._eraser_btn.blockSignals(True)
+        self._eraser_btn.setChecked(False)
+        self._eraser_btn.blockSignals(False)
 
     def _make_dpad(self):
         container = QWidget()
@@ -1485,7 +1513,9 @@ class MainWindow(QMainWindow):
         # assignment / preview mode
         self._mode           = "normal"
         self._selected_rect  = None     # [x, y, w, h] mutable
-        self._selected_angle = 0        # degrees
+        self._selected_angle = 0
+        self._eraser_active  = False
+        self._erase_mask     = None   # np.ndarray bool, applied after filters
         self._zoom_origin    = (0, 0)
         self._assigned       = {}       # letter_name → list of np.ndarray
         self._preview_letter = None
@@ -1516,6 +1546,13 @@ class MainWindow(QMainWindow):
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
 
+        font_menu = menu.addMenu("&Font")
+        self._create_font_act = QAction("&Create Font...", self)
+        self._create_font_act.setShortcut("Ctrl+F")
+        self._create_font_act.setEnabled(False)
+        self._create_font_act.triggered.connect(self._create_font)
+        font_menu.addAction(self._create_font_act)
+
         view_menu = menu.addMenu("&View")
         reset_zoom_act = QAction("Reset Zoom", self)
         reset_zoom_act.setShortcut("Ctrl+0")
@@ -1533,6 +1570,7 @@ class MainWindow(QMainWindow):
         self._viewer.pixel_clicked.connect(self._on_viewer_click)
         self._viewer.right_clicked.connect(self._on_back_clicked)
         self._viewer.drag_moved.connect(self._on_viewer_drag)
+        self._viewer.pixel_moved.connect(self._on_viewer_pixel_moved)
 
         self._scroll = QScrollArea()
         self._scroll.setWidget(self._viewer)
@@ -1547,6 +1585,7 @@ class MainWindow(QMainWindow):
         self._assign_panel.height_changed.connect(self._on_assign_height)
         self._assign_panel.angle_changed.connect(self._on_assign_angle)
         self._assign_panel.move_requested.connect(self._on_assign_move)
+        self._assign_panel.eraser_toggled.connect(self._on_eraser_toggled)
         self._assign_panel.hide()
 
         self._letter_preview = LetterPreviewWidget()
@@ -1566,7 +1605,8 @@ class MainWindow(QMainWindow):
             on_filter_changed=self._on_filter_changed,
             on_chars_toggled=self._on_chars_toggled,
         )
-        self._sidebar = Sidebar(on_select=self._on_image_selected)
+        self._sidebar = Sidebar(on_select=self._on_image_selected,
+                                on_merge_layers=self._merge_layers_or)
         self._alphabet_bar = HebrewAlphabetBar(on_letter_clicked=self._on_letter_clicked)
         self._alphabet_bar._return_btn.setEnabled(False)
         self._alphabet_bar._return_btn.clicked.connect(self._on_back_clicked)
@@ -1623,8 +1663,8 @@ class MainWindow(QMainWindow):
             return
         filtered = self._apply_filters(img)
         if self._show_chars:
-            self._line_rects = detect_lines(img, self._seg_settings)
-            self._char_rects = detect_characters(img, self._line_rects, self._seg_settings)
+            self._line_rects = detect_lines(filtered, self._seg_settings)
+            self._char_rects = detect_characters(filtered, self._line_rects, self._seg_settings)
         result = draw_overlays(filtered, self._char_rects, self._show_chars)
         self._viewer.set_pixmap(cv_to_pixmap(result))
         h, w = img.shape[:2]
@@ -1662,6 +1702,8 @@ class MainWindow(QMainWindow):
 
     def _on_viewer_click(self, ix, iy):
         if self._mode == "assignment":
+            if self._eraser_active:
+                self._erase_at(ix, iy)
             return
         if not self._char_rects:
             return
@@ -1675,6 +1717,7 @@ class MainWindow(QMainWindow):
         self._mode = "assignment"
         self._selected_rect = list(self._char_rects[rect_idx])
         self._selected_angle = 0
+        self._erase_mask = None
         self._assign_panel.set_rect(self._selected_rect[2], self._selected_rect[3])
         self._assign_panel.set_angle(0)
         self._assign_panel.show()
@@ -1700,6 +1743,9 @@ class MainWindow(QMainWindow):
         self._viewer.set_display_origin(0, 0)
         self._viewer.setCursor(Qt.CursorShape.ArrowCursor)
         self._viewer.set_zoom_enabled(True)
+        self._eraser_active = False
+        self._erase_mask = None
+        self._assign_panel.reset_eraser()
         self._refresh_view()
 
     def _render_assignment(self):
@@ -1707,6 +1753,16 @@ class MainWindow(QMainWindow):
             return
         img = self._load_cv(self._current_path)
         filtered = self._apply_filters(img)
+
+        # Apply erase mask — force exact white after all filters
+        if self._erase_mask is not None:
+            ih2, iw2 = filtered.shape[:2]
+            mask = self._erase_mask[:ih2, :iw2]
+            if len(filtered.shape) == 3:
+                filtered[mask] = (255, 255, 255)
+            else:
+                filtered[mask] = 255
+
         x, y, w, h = [int(v) for v in self._selected_rect]
         ih, iw = filtered.shape[:2]
 
@@ -1748,6 +1804,8 @@ class MainWindow(QMainWindow):
     def _on_viewer_drag(self, dx, dy):
         if self._mode != "assignment" or self._selected_rect is None:
             return
+        if self._eraser_active:
+            return
         img = self._load_cv(self._current_path)
         ih, iw = img.shape[:2]
         x, y, w, h = self._selected_rect
@@ -1781,6 +1839,30 @@ class MainWindow(QMainWindow):
         self._selected_rect[1] = max(0, min(ih - h, y + dy))
         self._render_assignment()
 
+    def _on_eraser_toggled(self, active):
+        self._eraser_active = active
+        if self._mode == "assignment":
+            cursor = Qt.CursorShape.CrossCursor if active else Qt.CursorShape.SizeAllCursor
+            self._viewer.setCursor(cursor)
+
+    def _erase_at(self, ix, iy):
+        if not self._current_path:
+            return
+        img = self._load_cv(self._current_path)
+        if img is None:
+            return
+        ih, iw = img.shape[:2]
+        if self._erase_mask is None or self._erase_mask.shape != (ih, iw):
+            self._erase_mask = np.zeros((ih, iw), dtype=bool)
+        x = max(0, min(iw - 1, int(round(ix))))
+        y = max(0, min(ih - 1, int(round(iy))))
+        self._erase_mask[y:min(ih, y + 2), x:min(iw, x + 2)] = True
+        self._render_assignment()
+
+    def _on_viewer_pixel_moved(self, ix, iy):
+        if self._mode == "assignment" and self._eraser_active:
+            self._erase_at(ix, iy)
+
     def _extract_rotated(self, img, x, y, w, h, angle):
         ih, iw = img.shape[:2]
         cx, cy = x + w / 2, y + h / 2
@@ -1811,10 +1893,13 @@ class MainWindow(QMainWindow):
             tile = self._alphabet_bar.tile(name)
             if tile:
                 tile.set_has_images(True)
+            self._update_create_font_action()
             entry = next((e for e in HEBREW_ALPHABET if e[0] == name), None)
             lbl = entry[2] if entry else name
+            filled = sum(1 for n, _, _ in HEBREW_ALPHABET if self._assigned.get(n))
             self._status.showMessage(
-                f"✓ Assigned to {lbl} — total: {len(self._assigned[name])} sample(s)"
+                f"✓ Assigned to {lbl} — {len(self._assigned[name])} sample(s)  "
+                f"({filled}/{len(HEBREW_ALPHABET)} letters filled)"
             )
 
         elif self._mode == "normal":
@@ -1857,13 +1942,73 @@ class MainWindow(QMainWindow):
         tile = self._alphabet_bar.tile(name)
         if tile:
             tile.set_has_images(len(self._assigned[name]) > 0)
-        # refresh the preview grid
+        self._update_create_font_action()
         entry = next((e for e in HEBREW_ALPHABET if e[0] == name), None)
         if entry:
             self._letter_preview.populate(entry[1], entry[2], self._assigned[name])
         self._status.showMessage(
             f"Removed sample — {len(self._assigned[name])} remaining"
         )
+
+    def _update_create_font_action(self):
+        all_filled = all(
+            bool(self._assigned.get(name))
+            for name, _, _ in HEBREW_ALPHABET
+        )
+        self._create_font_act.setEnabled(all_filled)
+
+    def _create_font(self):
+        missing = [label for name, _, label in HEBREW_ALPHABET
+                   if not self._assigned.get(name)]
+        if missing:
+            self._status.showMessage(
+                f"Missing letters: {', '.join(missing)}")
+            return
+        # Font creation will be implemented here
+        self._status.showMessage(
+            f"Ready to create font — {len(HEBREW_ALPHABET)} letters, "
+            f"{sum(len(v) for v in self._assigned.values())} total samples")
+
+    def _merge_layers_or(self):
+        panel = self._sidebar._layers_panel
+        paths = []
+        for i in range(panel.list_widget.count()):
+            item = panel.list_widget.item(i)
+            w = panel.list_widget.itemWidget(item)
+            if w:
+                paths.append(w.path)
+
+        if len(paths) < 2:
+            self._status.showMessage("Need at least 2 layers to merge.")
+            return
+
+        imgs = []
+        for path in paths:
+            img = cv2.imread(path)
+            if img is not None:
+                imgs.append(img)
+
+        if not imgs:
+            return
+
+        # Resize all to the first layer's dimensions
+        h, w = imgs[0].shape[:2]
+        result = imgs[0].copy()
+        for img in imgs[1:]:
+            if img.shape[:2] != (h, w):
+                img = cv2.resize(img, (w, h))
+            # Pixel-wise minimum = OR in ink space (darkest pixel wins)
+            result = np.minimum(result, img)
+
+        os.makedirs(LAYERS_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"layer_merged_{timestamp}.png"
+        out_path = os.path.join(LAYERS_DIR, filename)
+        cv2.imwrite(out_path, result)
+
+        self._sidebar.add_layer(out_path)
+        self._status.showMessage(
+            f"Merged {len(imgs)} layers with OR → {filename}")
 
     def _save_layer(self):
         if not self._current_path:
