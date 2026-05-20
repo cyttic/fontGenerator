@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QListWidget, QListWidgetItem, QSplitter, QButtonGroup,
     QDialog, QGroupBox, QFormLayout, QSlider, QComboBox,
-    QDialogButtonBox, QFrame, QSpinBox, QDoubleSpinBox
+    QDialogButtonBox, QFrame, QSpinBox, QDoubleSpinBox, QGridLayout
 )
 from PyQt6.QtGui import (
     QPixmap, QIcon, QAction, QKeySequence, QPainter, QColor,
@@ -692,6 +692,126 @@ class HebrewAlphabetBar(QWidget):
         return self._tiles.get(name)
 
 
+# ── Letter preview widgets ─────────────────────────────────────────────────
+
+class ImagePreviewCard(QFrame):
+    removed = pyqtSignal(int)
+
+    def __init__(self, img_bgr, index, parent=None):
+        super().__init__(parent)
+        self._index = index
+        self.setFixedSize(162, 162)
+        self._apply_style(False)
+
+        img_lbl = QLabel(self)
+        img_lbl.setGeometry(6, 6, 150, 150)
+        img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img_lbl.setStyleSheet("border: none; background: transparent;")
+        px = cv_to_pixmap(img_bgr)
+        img_lbl.setPixmap(px.scaled(
+            150, 150,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ))
+
+        self._del = QPushButton("✕", self)
+        self._del.setGeometry(136, 4, 22, 22)
+        self._del.setStyleSheet("""
+            QPushButton {
+                background: #e05050; color: white; border: none;
+                border-radius: 11px; font-size: 10px; font-weight: bold;
+            }
+            QPushButton:hover { background: #c03030; }
+        """)
+        self._del.hide()
+        self._del.clicked.connect(lambda: self.removed.emit(self._index))
+
+    def _apply_style(self, hovered):
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {C_BG};
+                border: {'2px solid ' + C_SELECTED if hovered else '1px solid ' + C_BORDER};
+                border-radius: 6px;
+            }}
+        """)
+
+    def enterEvent(self, e):
+        self._apply_style(True)
+        self._del.show()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._apply_style(False)
+        self._del.hide()
+        super().leaveEvent(e)
+
+
+class LetterPreviewWidget(QWidget):
+    image_removed = pyqtSignal(int)
+    right_clicked = pyqtSignal()
+
+    COLS = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"background: {C_BG};")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._header = QLabel()
+        self._header.setFixedHeight(40)
+        self._header.setStyleSheet(
+            f"color: {C_TEXT}; font-size: 14px; font-weight: bold; "
+            f"padding-left: 16px; background: {C_SIDEBAR_HDR}; "
+            f"border-bottom: 1px solid {C_BORDER};"
+        )
+        outer.addWidget(self._header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(f"border: none; background: {C_BG};")
+
+        self._grid_widget = QWidget()
+        self._grid_widget.setStyleSheet(f"background: {C_BG};")
+        self._grid = QGridLayout(self._grid_widget)
+        self._grid.setContentsMargins(16, 16, 16, 16)
+        self._grid.setSpacing(12)
+        self._grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+        scroll.setWidget(self._grid_widget)
+        outer.addWidget(scroll)
+
+    def populate(self, letter_char, label, images):
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        n = len(images)
+        self._header.setText(
+            f"  {letter_char}  —  {label}  —  {n} sample{'s' if n != 1 else ''}"
+        )
+
+        if n == 0:
+            empty = QLabel("No images assigned to this letter yet")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 14px;")
+            self._grid.addWidget(empty, 0, 0)
+            return
+
+        for i, img in enumerate(images):
+            card = ImagePreviewCard(img, i)
+            card.removed.connect(self.image_removed.emit)
+            self._grid.addWidget(card, i // self.COLS, i % self.COLS)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            self.right_clicked.emit()
+        super().mousePressEvent(e)
+
+
 # ── Image list sidebar ─────────────────────────────────────────────────────
 
 class ImageListItem(QWidget):
@@ -1024,11 +1144,12 @@ class MainWindow(QMainWindow):
         self._show_chars   = False
         self._seg_settings = SegmentationSettings()
         self._settings_dialog = None
-        # assignment mode
-        self._mode          = "normal"
-        self._selected_rect = None     # [x, y, w, h] mutable
-        self._zoom_origin   = (0, 0)   # crop top-left in image coords
-        self._assigned      = {}       # letter_name → list of np.ndarray
+        # assignment / preview mode
+        self._mode           = "normal"
+        self._selected_rect  = None     # [x, y, w, h] mutable
+        self._zoom_origin    = (0, 0)
+        self._assigned       = {}       # letter_name → list of np.ndarray
+        self._preview_letter = None
 
         self._build_menu()
         self._build_central()
@@ -1059,25 +1180,32 @@ class MainWindow(QMainWindow):
     def _build_central(self):
         self._viewer = ImageViewer()
         self._viewer.pixel_clicked.connect(self._on_viewer_click)
-        self._viewer.right_clicked.connect(self._exit_assignment)
+        self._viewer.right_clicked.connect(self._on_back_clicked)
         self._viewer.drag_moved.connect(self._on_viewer_drag)
 
-        scroll = QScrollArea()
-        scroll.setWidget(self._viewer)
-        scroll.setWidgetResizable(True)
-        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        scroll.setStyleSheet(f"border: none; background: {C_BG};")
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(self._viewer)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._scroll.setStyleSheet(f"border: none; background: {C_BG};")
+        scroll = self._scroll
 
         self._assign_panel = AssignmentPanel()
         self._assign_panel.width_changed.connect(self._on_assign_width)
         self._assign_panel.height_changed.connect(self._on_assign_height)
         self._assign_panel.hide()
 
+        self._letter_preview = LetterPreviewWidget()
+        self._letter_preview.image_removed.connect(self._on_preview_remove)
+        self._letter_preview.right_clicked.connect(self._exit_preview)
+        self._letter_preview.hide()
+
         view_row = QWidget()
         view_row_layout = QHBoxLayout(view_row)
         view_row_layout.setContentsMargins(0, 0, 0, 0)
         view_row_layout.setSpacing(0)
         view_row_layout.addWidget(scroll)
+        view_row_layout.addWidget(self._letter_preview)
         view_row_layout.addWidget(self._assign_panel)
 
         self._filter_bar = FilterBar(
@@ -1087,7 +1215,7 @@ class MainWindow(QMainWindow):
         self._sidebar = Sidebar(on_select=self._on_image_selected)
         self._alphabet_bar = HebrewAlphabetBar(on_letter_clicked=self._on_letter_clicked)
         self._alphabet_bar._return_btn.setEnabled(False)
-        self._alphabet_bar._return_btn.clicked.connect(self._exit_assignment)
+        self._alphabet_bar._return_btn.clicked.connect(self._on_back_clicked)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -1195,6 +1323,12 @@ class MainWindow(QMainWindow):
         self._viewer.setCursor(Qt.CursorShape.SizeAllCursor)
         self._render_assignment()
 
+    def _on_back_clicked(self):
+        if self._mode == "assignment":
+            self._exit_assignment()
+        elif self._mode == "preview":
+            self._exit_preview()
+
     def _exit_assignment(self):
         if self._mode != "assignment":
             return
@@ -1266,34 +1400,73 @@ class MainWindow(QMainWindow):
             self._render_assignment()
 
     def _on_letter_clicked(self, name):
-        if self._mode != "assignment":
+        if self._mode == "assignment":
+            # Assign current crop to letter
+            img = self._load_cv(self._current_path)
+            filtered = self._apply_filters(img)
+            x, y, w, h = [int(v) for v in self._selected_rect]
+            ih, iw = filtered.shape[:2]
+            x  = max(0, min(iw - 1, x));  y  = max(0, min(ih - 1, y))
+            x2 = min(iw, x + w);           y2 = min(ih, y + h)
+            crop = filtered[y:y2, x:x2].copy()
+            if name not in self._assigned:
+                self._assigned[name] = []
+            self._assigned[name].append(crop)
+            tile = self._alphabet_bar.tile(name)
+            if tile:
+                tile.set_has_images(True)
             entry = next((e for e in HEBREW_ALPHABET if e[0] == name), None)
-            if entry:
-                self._status.showMessage(
-                    f"Letter: {entry[2]} ({entry[1]}) — enable character detection first")
+            lbl = entry[2] if entry else name
+            self._status.showMessage(
+                f"✓ Assigned to {lbl} — total: {len(self._assigned[name])} sample(s)"
+            )
+
+        elif self._mode == "normal":
+            self._enter_preview(name)
+
+    def _enter_preview(self, name):
+        entry = next((e for e in HEBREW_ALPHABET if e[0] == name), None)
+        if not entry:
             return
+        self._mode = "preview"
+        self._preview_letter = name
+        images = self._assigned.get(name, [])
+        self._letter_preview.populate(entry[1], entry[2], images)
+        # swap: hide viewer scroll, show preview
+        self._letter_preview.show()
+        self._scroll.hide()
+        self._alphabet_bar._return_btn.setEnabled(True)
+        self._status.showMessage(
+            f"Preview: {entry[2]} ({entry[1]}) — {len(images)} sample(s)  |  "
+            f"right-click or ← Back to exit"
+        )
 
-        # Assign current crop to letter
-        img = self._load_cv(self._current_path)
-        filtered = self._apply_filters(img)
-        x, y, w, h = [int(v) for v in self._selected_rect]
-        ih, iw = filtered.shape[:2]
-        x = max(0, min(iw - 1, x));  y = max(0, min(ih - 1, y))
-        x2 = min(iw, x + w);         y2 = min(ih, y + h)
-        crop = filtered[y:y2, x:x2].copy()
+    def _exit_preview(self):
+        if self._mode != "preview":
+            return
+        self._mode = "preview_exit"
+        self._letter_preview.hide()
+        self._scroll.show()
+        self._alphabet_bar._return_btn.setEnabled(False)
+        self._preview_letter = None
+        self._mode = "normal"
+        self._refresh_view()
 
+    def _on_preview_remove(self, index):
+        name = self._preview_letter
         if name not in self._assigned:
-            self._assigned[name] = []
-        self._assigned[name].append(crop)
-
+            return
+        del self._assigned[name][index]
+        # update tile indicator
         tile = self._alphabet_bar.tile(name)
         if tile:
-            tile.set_has_images(True)
-
+            tile.set_has_images(len(self._assigned[name]) > 0)
+        # refresh the preview grid
         entry = next((e for e in HEBREW_ALPHABET if e[0] == name), None)
-        label = entry[2] if entry else name
+        if entry:
+            self._letter_preview.populate(entry[1], entry[2], self._assigned[name])
         self._status.showMessage(
-            f"✓ Assigned to {label} — total: {len(self._assigned[name])} sample(s)"
+            f"Removed sample — {len(self._assigned[name])} remaining"
         )
 
     def _open_settings(self):
