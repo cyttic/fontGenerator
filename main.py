@@ -141,13 +141,20 @@ _active_char_rects = []   # set by MainWindow before calling filters
 def filter_isolate_chars(img):
     if not _active_char_rects:
         return img
-    if len(img.shape) == 2:
-        result = np.full_like(img, 255)
-    else:
-        result = np.full_like(img, 255)
+    result = np.full_like(img, 255)
     for (x, y, w, h) in _active_char_rects:
         y2, x2 = min(y + h, img.shape[0]), min(x + w, img.shape[1])
         result[y:y2, x:x2] = img[y:y2, x:x2]
+    return result
+
+
+def filter_remove_chars(img):
+    if not _active_char_rects:
+        return img
+    result = img.copy()
+    for (x, y, w, h) in _active_char_rects:
+        y2, x2 = min(y + h, img.shape[0]), min(x + w, img.shape[1])
+        result[y:y2, x:x2] = 255
     return result
 
 
@@ -160,6 +167,7 @@ class SegmentationSettings:
     line_kernel_width: int = 40
     line_threshold_pct: int = 5      # percent 1-30
     min_area: int = 20
+    max_area: int = 5000
     min_width: int = 2
     min_height: int = 2
     max_width: int = 25
@@ -209,7 +217,7 @@ def detect_characters(img, line_rects, s: SegmentationSettings):
         n, _, stats, _ = cv2.connectedComponentsWithStats(region, connectivity=s.connectivity)
         for i in range(1, n):
             x, y, w, h, area = stats[i]
-            if (area >= s.min_area and
+            if (s.min_area <= area <= s.max_area and
                     s.min_width <= w <= s.max_width and
                     s.min_height <= h <= s.max_height):
                 rects.append((lx + x, ly + y, w, h))
@@ -298,13 +306,22 @@ def icon_deskew(p, s):
 
 
 def icon_isolate(p, s):
-    # White background with small dark letter-like squares
     p.fillRect(QRect(2, 2, s - 4, s - 4), QColor("#fff"))
     p.setPen(QPen(QColor(C_BORDER), 1))
     p.drawRect(QRect(2, 2, s - 4, s - 4))
     p.setPen(Qt.PenStyle.NoPen)
     for rx, ry, rw, rh in [(5, 6, 5, 10), (13, 8, 4, 8), (19, 5, 4, 12)]:
         p.fillRect(QRect(rx, ry, rw, rh), QColor("#333"))
+
+
+def icon_remove_chars(p, s):
+    # Dark background with white cutouts where letters were
+    p.fillRect(QRect(2, 2, s - 4, s - 4), QColor("#ccc"))
+    p.setPen(QPen(QColor(C_BORDER), 1))
+    p.drawRect(QRect(2, 2, s - 4, s - 4))
+    p.setPen(Qt.PenStyle.NoPen)
+    for rx, ry, rw, rh in [(5, 6, 5, 10), (13, 8, 4, 8), (19, 5, 4, 12)]:
+        p.fillRect(QRect(rx, ry, rw, rh), QColor("#fff"))
 
 
 def icon_characters(p, s):
@@ -402,6 +419,9 @@ class SettingsDialog(QDialog):
         form.addRow("Min area (px²):",
                     self._slider(5, 500, self.settings.min_area, 5,
                                  "min_area", suffix="px²"))
+        form.addRow("Max area (px²):",
+                    self._slider(100, 10000, self.settings.max_area, 100,
+                                 "max_area", suffix="px²"))
         form.addRow("Min width:",
                     self._slider(1, 100, self.settings.min_width, 1,
                                  "min_width", suffix="px"))
@@ -495,7 +515,8 @@ FILTERS = [
     ("CLAHE",      icon_clahe,     filter_clahe,     "Contrast enhancement (CLAHE)"),
     ("Denoise",    icon_denoise,   filter_denoise,   "Noise removal (median + morphology)"),
     ("Deskew",    icon_deskew,   filter_deskew,        "Auto deskew correction"),
-    ("Isolate",   icon_isolate,  filter_isolate_chars, "Show only detected characters on white background"),
+    ("Isolate",  icon_isolate,       filter_isolate_chars, "Show only detected characters on white background"),
+    ("Erase",    icon_remove_chars,  filter_remove_chars,  "Remove detected characters, keep background"),
 ]
 
 
