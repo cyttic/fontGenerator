@@ -29,7 +29,11 @@ def load_settings() -> "SegmentationSettings":
         s = SegmentationSettings()
         for k, v in data.items():
             if hasattr(s, k):
-                setattr(s, k, type(getattr(s, k))(v))
+                default = getattr(s, k)
+                if isinstance(default, bool):
+                    setattr(s, k, bool(v))
+                else:
+                    setattr(s, k, type(default)(v))
         return s
     except (FileNotFoundError, json.JSONDecodeError, Exception):
         return SegmentationSettings()
@@ -192,6 +196,10 @@ class SegmentationSettings:
     max_width: int = 25
     max_height: int = 25
     connectivity: int = 8
+    use_kraken: bool = False
+    kraken_model_path: str = "/home/cyttic/.local/share/htrmopo/97665cf3-f83d-5594-8855-f28d3af9df7a/blla.mlmodel"
+    kraken_direction: str = "horizontal-rl"   # rl = right-to-left (Hebrew)
+    kraken_device: str = "cpu"               # cpu or cuda
 
 
 # ── Segmentation functions ────────────────────────────────────────────────
@@ -240,6 +248,61 @@ def detect_characters(img, line_rects, s: SegmentationSettings):
                     s.min_width <= w <= s.max_width and
                     s.min_height <= h <= s.max_height):
                 rects.append((lx + x, ly + y, w, h))
+    return rects
+
+
+_kraken_model_cache = {}   # path → loaded model
+
+
+def detect_lines_kraken(img, s):
+    import glob as _glob
+    try:
+        from PIL import Image as PILImage
+        from kraken import blla
+        from kraken.lib import models as kmodels
+    except ImportError:
+        return detect_lines(img, s)
+
+    path = s.kraken_model_path
+    if not path or not os.path.exists(path):
+        # auto-find first available model
+        found = _glob.glob(
+            os.path.expanduser("~/.local/share/htrmopo/**/*.mlmodel"),
+            recursive=True
+        )
+        if not found:
+            return detect_lines(img, s)
+        path = found[0]
+
+    if path not in _kraken_model_cache:
+        from kraken.lib.vgsl import TorchVGSLModel
+        _kraken_model_cache[path] = TorchVGSLModel.load_model(path)
+    model = _kraken_model_cache[path]
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if len(img.shape) == 3 else \
+          cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    pil_img = PILImage.fromarray(rgb)
+
+    result = blla.segment(pil_img, model=model,
+                         text_direction=s.kraken_direction,
+                         device=s.kraken_device)
+
+    rects = []
+    ih, iw = img.shape[:2]
+    for line in result.lines:
+        if hasattr(line, 'bbox'):
+            x1, y1, x2, y2 = line.bbox
+        elif hasattr(line, 'boundary') and line.boundary:
+            pts = np.array(line.boundary)
+            x1, y1 = pts.min(axis=0)
+            x2, y2 = pts.max(axis=0)
+        else:
+            continue
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(iw, x2); y2 = min(ih, y2)
+        if x2 > x1 and y2 > y1:
+            rects.append((x1, y1, x2 - x1, y2 - y1))
     return rects
 
 
@@ -425,6 +488,36 @@ class SettingsDialog(QDialog):
     def _group_lines(self):
         group = self._make_group("Line Detection")
         form = QFormLayout(group)
+
+        # Kraken toggle
+        kraken_chk = QComboBox()
+        kraken_chk.addItems(["Projection profile (fast)", "Kraken ML model (precise)"])
+        kraken_chk.setCurrentIndex(1 if self.settings.use_kraken else 0)
+        kraken_chk.setStyleSheet(self._combo_style())
+        kraken_chk.currentIndexChanged.connect(
+            lambda i: self._set_and_notify("use_kraken", i == 1))
+        form.addRow("Method:", kraken_chk)
+
+        direction_box = QComboBox()
+        direction_box.addItems(["horizontal-rl  (Hebrew / Arabic)",
+                                "horizontal-lr  (Latin / LTR)"])
+        direction_box.setCurrentIndex(
+            0 if self.settings.kraken_direction == "horizontal-rl" else 1)
+        direction_box.setStyleSheet(self._combo_style())
+        direction_box.currentIndexChanged.connect(
+            lambda i: self._set_and_notify(
+                "kraken_direction",
+                "horizontal-rl" if i == 0 else "horizontal-lr"))
+        form.addRow("Text direction:", direction_box)
+
+        device_box = QComboBox()
+        device_box.addItems(["cpu", "cuda"])
+        device_box.setCurrentIndex(0 if self.settings.kraken_device == "cpu" else 1)
+        device_box.setStyleSheet(self._combo_style())
+        device_box.currentIndexChanged.connect(
+            lambda i: self._set_and_notify(
+                "kraken_device", "cpu" if i == 0 else "cuda"))
+        form.addRow("Device:", device_box)
 
         form.addRow("Merge kernel width:",
                     self._slider(10, 120, self.settings.line_kernel_width, 1,
@@ -1663,7 +1756,10 @@ class MainWindow(QMainWindow):
             return
         filtered = self._apply_filters(img)
         if self._show_chars:
-            self._line_rects = detect_lines(filtered, self._seg_settings)
+            if self._seg_settings.use_kraken:
+                self._line_rects = detect_lines_kraken(filtered, self._seg_settings)
+            else:
+                self._line_rects = detect_lines(filtered, self._seg_settings)
             self._char_rects = detect_characters(filtered, self._line_rects, self._seg_settings)
         result = draw_overlays(filtered, self._char_rects, self._show_chars)
         self._viewer.set_pixmap(cv_to_pixmap(result))
@@ -2140,6 +2236,7 @@ class MainWindow(QMainWindow):
 
     def _on_settings_changed(self):
         save_settings(self._seg_settings)
+        _kraken_model_cache.clear()   # reload if device or model path changed
         self._refresh_view()
 
 

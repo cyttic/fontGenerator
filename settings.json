@@ -1,6 +1,6 @@
 {
   "threshold_method": "manual",
-  "manual_threshold": 144,
+  "manual_threshold": 170,
   "line_kernel_width": 120,
   "line_threshold_pct": 1,
   "min_area": 5,
@@ -9,5 +9,9 @@
   "min_height": 1,
   "max_width": 135,
   "max_height": 281,
-  "connectivity": 4
+  "connectivity": 8,
+  "use_kraken": false,
+  "kraken_model_path": "/home/cyttic/.local/share/htrmopo/97665cf3-f83d-5594-8855-f28d3af9df7a/blla.mlmodel",
+  "kraken_direction": "horizontal-rl",
+  "kraken_device": "cuda"
 }
